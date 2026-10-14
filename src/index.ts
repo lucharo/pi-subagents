@@ -2386,10 +2386,15 @@ Terse command-style prompts produce shallow, generic work.
    * is cleared on restart, so workflow children write their transcript here instead, and the settled run leaves
    * `run.json` (its final snapshot) beside them. Claude Code keeps subagent transcripts permanently the same way.
    */
+  // Remembered per run: a run stopped by the session ending settles after its ctx went stale, and must still write.
+  const runDirs = new Map<string, string>();
   function workflowRunDir(ctx: ExtensionContext, task: WorkflowTask): string | undefined {
+    const known = runDirs.get(task.id);
+    if (known) return known;
     try {
       const dir = join(getAgentDir(), "subagents", ctx.sessionManager.getSessionId(), task.id);
       mkdirSync(dir, { recursive: true });
+      runDirs.set(task.id, dir);
       return dir;
     } catch {
       return undefined;
@@ -2724,6 +2729,7 @@ Terse command-style prompts produce shallow, generic work.
       });
       workflowTasks.set(runId, task);
       task.onChange = () => publishWorkflow(task, true);
+      workflowRunDir(ctx, task);
       publishWorkflow(task, true);
       // The run's own row has to appear now, not when it settles. Its agents
       // are owned by it, so their lifecycle callbacks no longer refresh these
@@ -2884,6 +2890,7 @@ Terse command-style prompts produce shallow, generic work.
     const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
     workflowTasks.set(task.id, task);
     task.onChange = () => publishWorkflow(task, true);
+    workflowRunDir(ctx, task);
     publishWorkflow(task, true);
     widget.update();
     fleet.update();
