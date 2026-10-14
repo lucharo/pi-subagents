@@ -33,7 +33,7 @@
  */
 
 import { existsSync } from "node:fs";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
@@ -68,6 +68,12 @@ export interface WorkflowHostOptions {
    */
   workflowId?: string;
   gateTimeoutMs?: number;
+  /**
+   * Fork addition: called once per child when its session exists, with the
+   * manager record id and the prompt. index.ts uses it to give workflow children
+   * an `.output` transcript and to follow their tool calls for the snapshot.
+   */
+  onChildSession?: (recordId: string, session: AgentSession, prompt: string) => void;
 }
 
 /**
@@ -326,7 +332,13 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             },
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.
-            onSessionCreated: () => { sessionReady = true; reportResolved(); },
+            onSessionCreated: (session: AgentSession) => {
+              sessionReady = true;
+              reportResolved();
+              if (spawnedId !== undefined) {
+                try { deps.onChildSession?.(spawnedId, session, request.prompt); } catch { /* observers never break a run */ }
+              }
+            },
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),

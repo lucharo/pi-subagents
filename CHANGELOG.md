@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0-fluide.1] - 2026-10-14 (fork: lucharo/pi-subagents, branch `fluide`)
+
+Additions on top of 0.19.0 so another extension (fluide, the Pi desktop app) can draw workflow runs.
+
+### Added
+- **`subagents:workflow` on `pi.events`**: a JSON snapshot of a run (name, description, status, phases with counts, one row per agent with label, phase, state, model, tokens, timing, transcript path and its recent tool calls, logs) whenever it changes, at most every 300 ms per run, and at once when it starts and settles. Shape in `src/workflow/snapshot.ts`.
+- **`listWorkflows()` on the manager registry** (`globalThis[Symbol.for("pi-subagents:manager")]`), returning the same snapshots for every run this session knows.
+- **A settled run is appended to the session as a `subagents:workflow-run` entry**, so it stays readable after a reload.
+- **Workflow children write the same `.output` transcript Agent-tool agents do**, under the session's task dir, so a finished agent's conversation can be opened from disk.
+
+### Fixed
+- **The run summary counts agents, not log lines.** `stats()` walked the raw append-only log, where every agent writes a fresh entry on each update, so a 3-agent run read "3/15 agents" in the completion notification.
+
 ## [0.19.0] - 2026-08-25
 
 > **⚠️ Breaking — this release requires pi 0.84.0 or newer** (`peerDependencies` moves from `>=0.81.0`). `SubagentWorkflow` needs two host APIs that do not exist below it, and both fail the typecheck rather than degrading quietly — see the `Changed` entry below for which, and why neither was worth reimplementing to hold the old floor. npm flags an older pi at install time.

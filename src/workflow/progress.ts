@@ -328,8 +328,10 @@ export function stats(progress: readonly WorkflowEntry[], agentCount = 0): Workf
   let started = 0;
   let anyLive = false;
 
-  for (const entry of progress) {
-    if (entry.type !== "workflow_agent") continue;
+  // Collapsed first: the log is append-only and an agent writes a fresh entry on
+  // every update, so counting raw entries reported a 3-agent run as "3/15"
+  // (fork fix, lucharo/pi-subagents).
+  for (const entry of collapse(progress).agents) {
     seen++;
     if (entry.state === "done") {
       done++;

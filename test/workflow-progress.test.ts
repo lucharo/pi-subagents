@@ -307,6 +307,16 @@ describe("stats", () => {
     expect(stats([]).complete).toBe(false);
   });
 
+  it("counts each agent once although the log re-emits it on every update", () => {
+    // Three agents, each through start → progress → done: 9 log entries, 3 agents.
+    const log = [0, 1, 2].flatMap(index => [
+      agentEntry({ index, state: "start", queuedAt: 1 }),
+      agentEntry({ index, state: "progress", queuedAt: 1, startedAt: 2 }),
+      agentEntry({ index, state: "done", queuedAt: 1, startedAt: 2 }),
+    ]);
+    expect(stats(log, 3)).toMatchObject({ done: 3, total: 3, started: 3, running: false, complete: true });
+  });
+
   it("ignores log and phase entries", () => {
     const result = stats([
       { type: "workflow_log", message: "hi" },

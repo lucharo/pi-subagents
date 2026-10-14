@@ -70,6 +70,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
+import { type WorkflowChildInfo, type WorkflowToolCall, workflowSnapshot } from "./workflow/snapshot.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
@@ -743,6 +744,9 @@ export default function (pi: ExtensionAPI) {
       const record = manager.getRecord(id);
       return record !== undefined && isTopLevelAgent(record) ? record : undefined;
     },
+    // Fork addition: every workflow run this session knows, as JSON snapshots
+    // (the same shape the `subagents:workflow` event carries).
+    listWorkflows: () => listWorkflowSnapshots(),
   };
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
   if (ownsManagerRegistry) {
@@ -1111,6 +1115,10 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
+    for (const info of workflowChildren.values()) info.off?.();
+    workflowChildren.clear();
+    for (const t of publishTimers.values()) clearTimeout(t);
+    publishTimers.clear();
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
@@ -2311,6 +2319,118 @@ Terse command-style prompts produce shallow, generic work.
    */
   const workflowTasks = new Map<string, WorkflowTask>();
 
+  // ---- Fork addition (lucharo/pi-subagents): workflow snapshots for other extensions ----
+  //
+  // A run's phases and agents live only on its task, so nothing outside this
+  // extension could draw a running workflow. Each change is emitted as
+  // `subagents:workflow` (at most every PUBLISH_MS per run, and at once on start
+  // and settle), `listWorkflows()` on the manager registry returns them all, and
+  // a settled run is appended to the session as `subagents:workflow-run`.
+  // Workflow children also get the `.output` transcript Agent-tool agents get,
+  // so a reader can open one after its record is evicted.
+  const PUBLISH_MS = 300;
+  type ChildState = WorkflowChildInfo & { off?: () => void; taskId: string; open: Map<string, WorkflowToolCall> };
+  const workflowChildren = new Map<string, ChildState>();
+  const publishTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const lastPublished = new Map<string, number>();
+
+  const commandOf = (args: any): string | undefined => {
+    if (!args || typeof args !== "object") return undefined;
+    const v = args.command ?? args.cmd ?? args.path ?? args.file_path ?? args.pattern ?? args.url ?? args.query;
+    return typeof v === "string" ? (v.length > 300 ? `${v.slice(0, 299)}…` : v) : undefined;
+  };
+
+  function workflowChildInfo(recordId: string): WorkflowChildInfo | undefined {
+    const info = workflowChildren.get(recordId);
+    const rec = manager.getRecord(recordId);
+    if (rec && info) {
+      // Copied onto the cache so the figures outlive the record's eviction.
+      const tokens = getLifetimeTotal(rec.lifetimeUsage);
+      if (tokens > 0) info.tokens = tokens;
+      if (rec.toolUses > 0) info.toolUses = rec.toolUses;
+      if (rec.invocation?.modelName) info.model = rec.invocation.modelName;
+      if (rec.invocation?.modelId) info.modelId = rec.invocation.modelId;
+      if (rec.invocation?.thinking) info.thinking = rec.invocation.thinking;
+      if (rec.outputFile) info.outputFile = rec.outputFile;
+      const sf = (rec.session as any)?.sessionManager?.getSessionFile?.();
+      if (typeof sf === "string") info.sessionFile = sf;
+    }
+    if (!info) return undefined;
+    const { off: _off, taskId: _t, open: _o, ...plain } = info;
+    return plain;
+  }
+
+  function listWorkflowSnapshots() {
+    return [...workflowTasks.values()].map(task => workflowSnapshot(task, workflowChildInfo));
+  }
+
+  function publishWorkflow(task: WorkflowTask, now = false) {
+    const emit = () => {
+      publishTimers.delete(task.id);
+      lastPublished.set(task.id, Date.now());
+      try { pi.events.emit("subagents:workflow", workflowSnapshot(task, workflowChildInfo)); } catch { /* listeners never break a run */ }
+    };
+    if (now) {
+      const t = publishTimers.get(task.id);
+      if (t !== undefined) clearTimeout(t);
+      emit();
+      return;
+    }
+    if (publishTimers.has(task.id)) return;
+    const wait = Math.max(0, PUBLISH_MS - (Date.now() - (lastPublished.get(task.id) ?? 0)));
+    publishTimers.set(task.id, setTimeout(emit, wait));
+  }
+
+  function onWorkflowChild(ctx: ExtensionContext, task: WorkflowTask, recordId: string, session: any, prompt: string) {
+    const info: ChildState = { taskId: task.id, open: new Map(), tools: [] };
+    const rec = manager.getRecord(recordId);
+    if (rec && !rec.outputFile && getOutputTranscriptDefault()) {
+      try {
+        rec.outputFile = createOutputFilePath(ctx.cwd, recordId, ctx.sessionManager.getSessionId());
+        writeInitialEntry(rec.outputFile, recordId, prompt, ctx.cwd);
+        rec.outputCleanup = streamToOutputFile(session, rec.outputFile, recordId, ctx.cwd);
+        info.outputFile = rec.outputFile;
+      } catch { /* a transcript is a convenience, not part of the run */ }
+    }
+    if (typeof session?.subscribe === "function") {
+      info.off = session.subscribe((e: any) => {
+        if (e?.type === "tool_execution_start") {
+          const call: WorkflowToolCall = { id: String(e.toolCallId), name: String(e.toolName), startedAt: Date.now() };
+          const cmd = commandOf(e.args);
+          if (cmd !== undefined) call.command = cmd;
+          info.open.set(call.id, call);
+          info.tools!.push(call);
+          if (info.tools!.length > 40) info.tools!.splice(0, info.tools!.length - 40);
+          info.activity = call.name;
+        } else if (e?.type === "tool_execution_end") {
+          const call = info.open.get(String(e.toolCallId));
+          if (call) {
+            call.endedAt = Date.now();
+            if (e.isError) call.error = true;
+            info.open.delete(call.id);
+          }
+          info.activity = [...info.open.values()].pop()?.name;
+        } else if (e?.type !== "message_end" && e?.type !== "turn_end") return;
+        publishWorkflow(task);
+      });
+    }
+    workflowChildren.set(recordId, info);
+    publishWorkflow(task);
+  }
+
+  function settleWorkflowSnapshot(task: WorkflowTask) {
+    for (const info of workflowChildren.values()) {
+      if (info.taskId !== task.id) continue;
+      info.off?.();
+      info.off = undefined;
+      for (const call of info.open.values()) call.endedAt ??= Date.now();
+      info.open.clear();
+      info.activity = undefined;
+    }
+    publishWorkflow(task, true);
+    try { pi.appendEntry("subagents:workflow-run", workflowSnapshot(task, workflowChildInfo)); } catch { /* best effort */ }
+  }
+
   /**
    * Workflow runs as the fleet list wants them.
    *
@@ -2354,8 +2474,9 @@ Terse command-style prompts produce shallow, generic work.
           signal: task.abortController.signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
           workflowId: task.id,
+          onChildSession: (recordId, session, prompt) => onWorkflowChild(ctx, task, recordId, session, prompt),
         }),
-        onProgress: entries => updateWorkflowProgressBatch(task, entries),
+        onProgress: entries => { updateWorkflowProgressBatch(task, entries); publishWorkflow(task); },
         // The dialog's pause / skip / retry keys run through this; it is dropped
         // again when the task settles.
         onControl: control => { task.control = control; },
@@ -2370,6 +2491,7 @@ Terse command-style prompts produce shallow, generic work.
     } catch (err) {
       failWorkflowTask(task, err instanceof Error ? err.message : String(err));
     }
+    settleWorkflowSnapshot(task);
   }
 
   /**
@@ -2548,6 +2670,7 @@ Terse command-style prompts produce shallow, generic work.
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
       workflowTasks.set(runId, task);
+      publishWorkflow(task, true);
       // The run's own row has to appear now, not when it settles. Its agents
       // are owned by it, so their lifecycle callbacks no longer refresh these
       // surfaces — nothing else would register the widget for a run whose
@@ -2706,6 +2829,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
     workflowTasks.set(task.id, task);
+    publishWorkflow(task, true);
     widget.update();
     fleet.update();
     report(`Running workflow ${meta.name}…`, "info");
