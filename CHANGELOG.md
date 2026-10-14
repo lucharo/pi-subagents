@@ -15,7 +15,8 @@ Additions on top of 0.19.0 so another extension (fluide, the Pi desktop app) can
 - **`subagents:workflow` on `pi.events`**: a JSON snapshot of a run (name, description, status, phases with counts, one row per agent with label, phase, state, model, tokens, timing, transcript path and its recent tool calls, logs) whenever it changes, at most every 300 ms per run, and at once when it starts and settles. Shape in `src/workflow/snapshot.ts`.
 - **`listWorkflows()` on the manager registry** (`globalThis[Symbol.for("pi-subagents:manager")]`), returning the same snapshots for every run this session knows.
 - **A settled run is appended to the session as a `subagents:workflow-run` entry**, so it stays readable after a reload.
-- **Workflow children write the same `.output` transcript Agent-tool agents do**, under the session's task dir, so a finished agent's conversation can be opened from disk.
+- **Workflow children write the same `.output` transcript Agent-tool agents do, to a durable folder**: `<agent dir>/subagents/<session id>/<run id>/<record id>.output` (the OS tmpdir task dir is cleared on restart). A settled run also leaves `run.json` (its final snapshot and result) and `script.js` there.
+- **Tool calls that start background jobs** (`background`/`run_in_background`, `process start`) are marked `background: true` in the snapshot.
 
 ### Fixed
 - **The run summary counts agents, not log lines.** `stats()` walked the raw append-only log, where every agent writes a fresh entry on each update, so a 3-agent run read "3/15 agents" in the completion notification.

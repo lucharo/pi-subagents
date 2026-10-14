@@ -2381,12 +2381,28 @@ Terse command-style prompts produce shallow, generic work.
     publishTimers.set(task.id, setTimeout(emit, wait));
   }
 
+  /**
+   * Where a run's durable record lives: `<agent dir>/subagents/<session id>/<run id>/`. The task dir under the OS tmpdir
+   * is cleared on restart, so workflow children write their transcript here instead, and the settled run leaves
+   * `run.json` (its final snapshot) beside them. Claude Code keeps subagent transcripts permanently the same way.
+   */
+  function workflowRunDir(ctx: ExtensionContext, task: WorkflowTask): string | undefined {
+    try {
+      const dir = join(getAgentDir(), "subagents", ctx.sessionManager.getSessionId(), task.id);
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    } catch {
+      return undefined;
+    }
+  }
+
   function onWorkflowChild(ctx: ExtensionContext, task: WorkflowTask, recordId: string, session: any, prompt: string) {
     const info: ChildState = { taskId: task.id, open: new Map(), tools: [] };
     const rec = manager.getRecord(recordId);
     if (rec && !rec.outputFile && getOutputTranscriptDefault()) {
       try {
-        rec.outputFile = createOutputFilePath(ctx.cwd, recordId, ctx.sessionManager.getSessionId());
+        const dir = workflowRunDir(ctx, task);
+        rec.outputFile = dir ? join(dir, `${recordId}.output`) : createOutputFilePath(ctx.cwd, recordId, ctx.sessionManager.getSessionId());
         writeInitialEntry(rec.outputFile, recordId, prompt, ctx.cwd);
         rec.outputCleanup = streamToOutputFile(session, rec.outputFile, recordId, ctx.cwd);
         info.outputFile = rec.outputFile;
@@ -2421,7 +2437,7 @@ Terse command-style prompts produce shallow, generic work.
     publishWorkflow(task);
   }
 
-  function settleWorkflowSnapshot(task: WorkflowTask) {
+  function settleWorkflowSnapshot(ctx: ExtensionContext, task: WorkflowTask) {
     for (const info of workflowChildren.values()) {
       if (info.taskId !== task.id) continue;
       info.off?.();
@@ -2431,7 +2447,15 @@ Terse command-style prompts produce shallow, generic work.
       info.activity = undefined;
     }
     publishWorkflow(task, true);
-    try { pi.appendEntry("subagents:workflow-run", workflowSnapshot(task, workflowChildInfo)); } catch { /* best effort */ }
+    const snap = workflowSnapshot(task, workflowChildInfo);
+    try { pi.appendEntry("subagents:workflow-run", snap); } catch { /* best effort */ }
+    try {
+      const dir = workflowRunDir(ctx, task);
+      if (dir) {
+        writeFileSync(join(dir, "run.json"), `${JSON.stringify({ ...snap, result: workflowResultText(task) }, null, 2)}\n`, "utf-8");
+        writeFileSync(join(dir, "script.js"), task.script, "utf-8");
+      }
+    } catch { /* best effort */ }
   }
 
   /**
@@ -2494,7 +2518,7 @@ Terse command-style prompts produce shallow, generic work.
     } catch (err) {
       failWorkflowTask(task, err instanceof Error ? err.message : String(err));
     }
-    settleWorkflowSnapshot(task);
+    settleWorkflowSnapshot(ctx, task);
   }
 
   /**
