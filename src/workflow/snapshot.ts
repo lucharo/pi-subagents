@@ -25,6 +25,8 @@ export interface WorkflowToolCall {
   startedAt: number;
   endedAt?: number;
   error?: boolean;
+  /** The call started a job that keeps running after it returns (a backgrounded bash, `process start`). */
+  background?: boolean;
 }
 
 /** What the host side knows about a child that the progress log does not. */

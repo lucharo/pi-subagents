@@ -2398,6 +2398,9 @@ Terse command-style prompts produce shallow, generic work.
           const call: WorkflowToolCall = { id: String(e.toolCallId), name: String(e.toolName), startedAt: Date.now() };
           const cmd = commandOf(e.args);
           if (cmd !== undefined) call.command = cmd;
+          // A job that outlives its call: pi-bash-bg's `background`, a `run_in_background`, or `process start`.
+          const a = e.args ?? {};
+          if (a.background === true || a.run_in_background === true || (call.name === "process" && a.action === "start")) call.background = true;
           info.open.set(call.id, call);
           info.tools!.push(call);
           if (info.tools!.length > 40) info.tools!.splice(0, info.tools!.length - 40);
