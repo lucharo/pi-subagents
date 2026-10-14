@@ -2399,7 +2399,8 @@ Terse command-style prompts produce shallow, generic work.
   function onWorkflowChild(ctx: ExtensionContext, task: WorkflowTask, recordId: string, session: any, prompt: string) {
     const info: ChildState = { taskId: task.id, open: new Map(), tools: [] };
     const rec = manager.getRecord(recordId);
-    if (rec && !rec.outputFile && getOutputTranscriptDefault()) {
+    // Same policy as an Agent-tool spawn: the agent file's output_transcript wins, else the project default.
+    if (rec && !rec.outputFile && (getAgentConfig(rec.type)?.outputTranscript ?? getOutputTranscriptDefault())) {
       try {
         const dir = workflowRunDir(ctx, task);
         rec.outputFile = dir ? join(dir, `${recordId}.output`) : createOutputFilePath(ctx.cwd, recordId, ctx.sessionManager.getSessionId());
@@ -2408,6 +2409,14 @@ Terse command-style prompts produce shallow, generic work.
         info.outputFile = rec.outputFile;
       } catch { /* a transcript is a convenience, not part of the run */ }
     }
+    follow(task, info, session);
+    workflowChildren.set(recordId, info);
+    publishWorkflow(task);
+  }
+
+  /** Follow a child's tool calls (and repaint on its turns), for the snapshot's per-agent `tools` and `activity`. */
+  function follow(task: WorkflowTask, info: ChildState, session: any) {
+    info.off?.();
     if (typeof session?.subscribe === "function") {
       info.off = session.subscribe((e: any) => {
         if (e?.type === "tool_execution_start") {
@@ -2433,7 +2442,23 @@ Terse command-style prompts produce shallow, generic work.
         publishWorkflow(task);
       });
     }
+  }
+
+  /**
+   * An `agent({ resume })` call reopens a settled child: its transcript stream and tool-call follower were dropped
+   * when the first invocation settled, so both are re-attached from the session's current length.
+   */
+  function onWorkflowChildResume(ctx: ExtensionContext, task: WorkflowTask, recordId: string, session: any) {
+    const info = workflowChildren.get(recordId) ?? { taskId: task.id, open: new Map(), tools: [] };
     workflowChildren.set(recordId, info);
+    const rec = manager.getRecord(recordId);
+    if (rec?.outputFile && session) {
+      try {
+        rec.outputCleanup?.();
+        rec.outputCleanup = streamToOutputFile(session, rec.outputFile, recordId, ctx.cwd, session.messages?.length ?? 0);
+      } catch { /* a transcript is a convenience, not part of the run */ }
+    }
+    follow(task, info, session);
     publishWorkflow(task);
   }
 
@@ -2502,6 +2527,7 @@ Terse command-style prompts produce shallow, generic work.
           rootSessionId: ctx.sessionManager.getSessionId(),
           workflowId: task.id,
           onChildSession: (recordId, session, prompt) => onWorkflowChild(ctx, task, recordId, session, prompt),
+          onChildResume: (recordId, session) => onWorkflowChildResume(ctx, task, recordId, session),
         }),
         onProgress: entries => { updateWorkflowProgressBatch(task, entries); publishWorkflow(task); },
         // The dialog's pause / skip / retry keys run through this; it is dropped
@@ -2697,6 +2723,7 @@ Terse command-style prompts produce shallow, generic work.
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
       workflowTasks.set(runId, task);
+      task.onChange = () => publishWorkflow(task, true);
       publishWorkflow(task, true);
       // The run's own row has to appear now, not when it settles. Its agents
       // are owned by it, so their lifecycle callbacks no longer refresh these
@@ -2856,6 +2883,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
     workflowTasks.set(task.id, task);
+    task.onChange = () => publishWorkflow(task, true);
     publishWorkflow(task, true);
     widget.update();
     fleet.update();

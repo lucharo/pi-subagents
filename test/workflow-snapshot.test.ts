@@ -50,6 +50,7 @@ describe("workflowSnapshot (fork)", () => {
     const s = workflowSnapshot(t, () => undefined, 10_000);
     expect(s.agents.map(a => a.state)).toEqual(["done", "interrupted", "interrupted"]);
     expect(s.elapsedMs).toBe(5000);
+    expect(s.phases.map(p => [p.title, p.status, p.done, p.failed])).toEqual([["Scout", "done", 1, 0], ["Fan-out", "failed", 0, 2]]);
   });
 });
 
@@ -59,5 +60,18 @@ describe("agentSummary (fork)", () => {
     expect(agentSummary(3, 0, 3)).toBe("3 agents");
     expect(agentSummary(1, 0, 1)).toBe("1 agent");
     expect(agentSummary(2, 1, 3)).toBe("2/3 agents done, 1 failed");
+  });
+});
+
+describe("pause and resume tell a snapshot listener (fork)", () => {
+  it("calls task.onChange on pause and on resume", async () => {
+    const { createWorkflowTask, pauseWorkflowTask, resumeWorkflowTask } = await import("../src/workflow/task.js");
+    const t = createWorkflowTask({ id: "wf_abcdef123456", script: "" });
+    t.control = { pause() {}, resume() {}, isPaused: () => false, skip: () => false, retry: () => false };
+    const seen: string[] = [];
+    t.onChange = () => seen.push(t.status);
+    expect(pauseWorkflowTask(t, 1000)).toBe(true);
+    expect(resumeWorkflowTask(t, 2000)).toBe(true);
+    expect(seen).toEqual(["paused", "running"]);
   });
 });

@@ -48,6 +48,11 @@ export interface WorkflowTask {
    * thing it does for a run that has finished.
    */
   control?: WorkflowControl;
+  /**
+   * Fork addition: called when the status changes outside the progress log (pause, resume), so a snapshot listener
+   * hears about it even when no agent emits anything afterwards.
+   */
+  onChange?: () => void;
   /** When the current pause started, so `totalPausedMs` can be closed out. */
   pausedAt?: number;
 
@@ -174,6 +179,7 @@ export function pauseWorkflowTask(task: WorkflowTask, now = Date.now()): boolean
   task.control.pause();
   task.status = "paused";
   task.pausedAt = now;
+  task.onChange?.();
   return true;
 }
 
@@ -184,6 +190,7 @@ export function resumeWorkflowTask(task: WorkflowTask, now = Date.now()): boolea
   task.status = "running";
   task.totalPausedMs = (task.totalPausedMs ?? 0) + Math.max(0, now - (task.pausedAt ?? now));
   task.pausedAt = undefined;
+  task.onChange?.();
   return true;
 }
 

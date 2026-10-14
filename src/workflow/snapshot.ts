@@ -170,13 +170,24 @@ export function workflowSnapshot(
     };
     return row;
   });
+  const byIndex = new Map(rows.map((r) => [r.index, r]));
+  const FAILED = new Set(["failed", "skipped", "blocked", "interrupted"]);
   const phases: WorkflowPhaseSnapshot[] = groups.map((g) => {
+    // From the rows' display states, so a stopped run's unfinished agents count as interrupted here too.
+    let gd = 0;
     let gf = 0;
-    for (const a of g.agents) if (a.state === "error") gf++;
+    let live = 0;
+    for (const a of g.agents) {
+      const st = byIndex.get(a.index)?.state;
+      if (st === "done") gd++;
+      else if (st !== undefined && FAILED.has(st)) gf++;
+      else live++;
+    }
+    const status = g.agents.length === 0 ? g.status : live > 0 ? "running" : gf > 0 ? "failed" : "done";
     return {
       title: g.title,
-      status: g.status,
-      done: g.doneCount,
+      status,
+      done: gd,
       failed: gf,
       total: g.totalCount,
       tokens: g.agents.reduce((n, a) => n + (a.tokens ?? (a.recordId !== undefined ? children(a.recordId)?.tokens : undefined) ?? 0), 0),

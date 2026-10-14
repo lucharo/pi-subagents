@@ -74,6 +74,8 @@ export interface WorkflowHostOptions {
    * an `.output` transcript and to follow their tool calls for the snapshot.
    */
   onChildSession?: (recordId: string, session: AgentSession, prompt: string) => void;
+  /** Fork addition: called before a settled child is resumed (`agent({ resume })`), with its live session. */
+  onChildResume?: (recordId: string, session: AgentSession) => void;
 }
 
 /**
@@ -377,6 +379,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const id = records.get(agentId);
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
+      }
+      const live = manager.getRecord(id)?.session;
+      if (live) {
+        try { deps.onChildResume?.(id, live); } catch { /* observers never break a run */ }
       }
       const record = await manager.resume(id, prompt, deps.signal);
       if (record === undefined) {
