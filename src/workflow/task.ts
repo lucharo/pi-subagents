@@ -278,6 +278,16 @@ export function resolveResumeTarget(
   };
 }
 
+/**
+ * "3 agents", "2/3 agents done, 1 failed": fork wording. "3/15 agents" read as a cap
+ * or an index, and the count was of log lines (see `stats`).
+ */
+export function agentSummary(done: number, failed: number, total: number): string {
+  const noun = total === 1 ? "agent" : "agents";
+  if (total > 0 && done === total) return `${total} ${noun}`;
+  return `${done}/${total} ${noun} done${failed > 0 ? `, ${failed} failed` : ""}`;
+}
+
 /** `<task-notification>`, in the same shape a finished background agent sends. */
 export function formatWorkflowNotification(task: WorkflowTask, now = Date.now()): string {
   const totals = stats(task.workflowProgress, task.agentCount);
@@ -292,7 +302,7 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     task.toolCallId ? `<tool-use-id>${escapeXml(task.toolCallId)}</tool-use-id>` : null,
     task.scriptPath ? `<script>${escapeXml(task.scriptPath)}</script>` : null,
     `<status>${escapeXml(status)}</status>`,
-    `<summary>Workflow "${escapeXml(task.workflowName ?? task.id)}" ${task.status} — ${totals.done}/${totals.total} agents${
+    `<summary>Workflow "${escapeXml(task.workflowName ?? task.id)}" ${task.status} — ${agentSummary(totals.done, totals.failedCount, totals.total)}${
       task.replayedCount > 0 ? `, ${task.replayedCount} replayed from ${escapeXml(task.resumedFrom ?? "an earlier run")}` : ""
     }</summary>`,
     `<result>${escapeXml(result.length > 4000 ? `${result.slice(0, 4000)}\n...(truncated)` : result)}</result>`,
