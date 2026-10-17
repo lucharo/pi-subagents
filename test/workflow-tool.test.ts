@@ -951,13 +951,14 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(booted.pi.sendMessage).not.toHaveBeenCalled();
 
     // The card is the settled run's, not a frozen "starting" row.
-    const card = String(
-      tools.get("SubagentWorkflow")
-        .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false })
-        .text ?? "",
-    );
+    const card = tools.get("SubagentWorkflow")
+      .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false })
+      .render(120)
+      .join("\n");
     expect(card).toContain("from-inline");
     expect(card).toContain("scanned 3 files");
+    // No notification follows, so the outcome has to show under the card.
+    expect(card).toContain("done here");
   });
 
   it("hands a run that outlives the window to the background, and notifies when it settles", async () => {
@@ -1014,6 +1015,11 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(text).toMatch(/Nothing is running in the background/);
     expect(text).toContain("Error: script blew up");
     expect(text).not.toMatch(/started in the background/);
+    const card = tools.get("SubagentWorkflow")
+      .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false })
+      .render(120)
+      .join("\n");
+    expect(card).toContain("script blew up");
     await flush();
     expect(booted.pi.sendMessage).not.toHaveBeenCalled();
   });

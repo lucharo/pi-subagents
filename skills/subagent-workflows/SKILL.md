@@ -32,6 +32,6 @@ After every `schema` stage, drop the nulls before using the results: `results.fi
 
 1. Read the run's journal before diagnosing it: the `Journal:` path the tool returned (`<run id>.workflow.jsonl`). It records every agent's actual return value. A run's `run.json` (final snapshot and result) is under `<agent dir>/subagents/<session id>/<run id>/`.
 2. Edit the script file at that `Script:` path.
-3. Relaunch with `scriptPath` and `resumeFromRunId: "<run id>"`. Unchanged leading `agent()` calls return their recorded results at no cost; the first changed call and everything after it run live.
+3. Relaunch with `scriptPath`, `resumeFromRunId: "<run id>"` and the same `args` (they are not inherited; correct them here if they were the problem). Unchanged leading `agent()` calls return their recorded results at no cost; the first changed call and everything after it run live.
 
-Resume is the one way to reuse finished agents. Keep the sweep in that one edited script: a second script for the remaining half, or journals merged by hand into a new run, loses the replay and pays for the agents twice. If the edit changed an early call, everything after it reruns; put cheap or changed stages after the expensive ones you want to keep.
+Resume is the one way to reuse finished agents. Keep the sweep in that one edited script: a second script for the remaining half, or journals merged by hand into a new run, loses the replay and pays for the agents twice. If the edit changed an early call, everything after it reruns; put cheap or changed stages after the expensive ones you want to keep. One exception: `agent({ resume: label })` cannot continue an agent that was replayed, so when the error says to rerun without `resumeFromRunId`, do that.

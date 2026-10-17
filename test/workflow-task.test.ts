@@ -15,6 +15,7 @@ import {
   completeWorkflowTask,
   createWorkflowTask,
   failWorkflowTask,
+  formatSettledEarly,
   pauseWorkflowTask,
   resumeWorkflowTask,
   type WorkflowTask,
@@ -128,5 +129,39 @@ describe("settling a run", () => {
 
     expect(task.control).toBeUndefined();
     expect(task.status).toBe("failed");
+  });
+});
+
+describe("formatSettledEarly", () => {
+  const settled = (status: "completed" | "failed", outcome: string, agentCount = 0) => {
+    const task = createWorkflowTask({ id: "wf_abc123def456", script: "", meta: { name: "wf", description: "d" } });
+    task.agentCount = agentCount;
+    if (status === "failed") failWorkflowTask(task, outcome);
+    else {
+      task.status = "completed";
+      task.value = outcome;
+      task.endTime = task.startTime;
+    }
+    return task;
+  };
+
+  it("bounds a long result like the notification does, and points at the full one", () => {
+    const text = formatSettledEarly(settled("completed", "x".repeat(10_000)), "/runs/wf_abc123def456");
+    expect(text.length).toBeLessThan(5_000);
+    expect(text).toContain("...(truncated)");
+    expect(text).toContain("Full result: /runs/wf_abc123def456/run.json");
+  });
+
+  it("recommends resuming with the same args once agent calls have settled", () => {
+    const text = formatSettledEarly(settled("failed", "boom", 2));
+    expect(text).toMatch(/same `args` and resumeFromRunId: "wf_abc123def456"/);
+  });
+
+  it("does not contradict a runtime error that says to rerun without resumeFromRunId", () => {
+    const text = formatSettledEarly(
+      settled("failed", 'agent() opts.resume: "a" was replayed from the resume journal, not run, so there is no conversation in this run to continue. Re-run without resumeFromRunId.', 2),
+    );
+    expect(text).toContain("Re-run without resumeFromRunId.");
+    expect(text).not.toMatch(/resumeFromRunId: "wf_/);
   });
 });

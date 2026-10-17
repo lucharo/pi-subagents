@@ -2653,12 +2653,12 @@ Terse command-style prompts produce shallow, generic work.
 
     renderResult(result, _options, theme, renderContext) {
       const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const taskId = (result.details as { taskId?: string } | undefined)?.taskId;
-      const task = taskId !== undefined ? workflowTasks.get(taskId) : undefined;
+      const details = result.details as { taskId?: string; settledEarly?: boolean } | undefined;
+      const task = details?.taskId !== undefined ? workflowTasks.get(details.taskId) : undefined;
       // No task means the run predates this session (a reloaded transcript) or
       // the call never started one — show what `execute` said instead.
       if (renderContext.isError || !task) return new Text(text, 0, 0);
-      return renderWorkflowCard(
+      const card = renderWorkflowCard(
         {
           progress: task.workflowProgress,
           task: {
@@ -2674,6 +2674,13 @@ Terse command-style prompts produce shallow, generic work.
         },
         theme,
       );
+      // A run that settled inside the handoff window sends no notification, so
+      // its outcome (result or error) has to show here, under the card.
+      if (!details?.settledEarly) return card;
+      const container = new Container();
+      container.addChild(card);
+      container.addChild(new Text(theme.fg(task.status === "failed" ? "error" : "muted", text), 0, 0));
+      return container;
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
@@ -2767,8 +2774,8 @@ Terse command-style prompts produce shallow, generic work.
         widget.update();
         fleet.update();
         return {
-          content: [{ type: "text" as const, text: nothingToReplay + formatSettledEarly(task) }],
-          details: { taskId: runId },
+          content: [{ type: "text" as const, text: nothingToReplay + formatSettledEarly(task, runDirs.get(task.id)) }],
+          details: { taskId: runId, settledEarly: true },
         };
       }
 

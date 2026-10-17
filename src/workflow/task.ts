@@ -334,9 +334,13 @@ export function startsLiveAgent(entries: readonly WorkflowEntry[]): boolean {
 }
 
 /** The tool result for a run that settled before it was handed to the background: no notification follows it. */
-export function formatSettledEarly(task: WorkflowTask, now = Date.now()): string {
+export function formatSettledEarly(task: WorkflowTask, runDir?: string, now = Date.now()): string {
   const name = task.workflowName ?? task.id;
   const took = formatDuration(elapsedMs(task, now));
+  // Same bound the notification uses: an inline result must not flood the caller's context either.
+  const result = workflowResultText(task);
+  const truncated = result.length > 4000;
+  const outcome = truncated ? `${result.slice(0, 4000)}\n...(truncated)` : result;
   const head =
     task.status === "completed" ? `Workflow "${name}" completed in ${took}.`
     : task.status === "killed" ? `Workflow "${name}" was stopped after ${took}.`
@@ -348,13 +352,16 @@ export function formatSettledEarly(task: WorkflowTask, now = Date.now()): string
     task.journalPath ? `Journal: ${task.journalPath}` : undefined,
     task.replayedCount > 0 ? `Replayed ${task.replayedCount} recorded call(s) from ${task.resumedFrom ?? "an earlier run"}.` : undefined,
     "",
-    task.status === "failed" ? `Error: ${workflowResultText(task)}` : `Result:\n${workflowResultText(task)}`,
+    task.status === "failed" ? `Error: ${outcome}` : `Result:\n${outcome}`,
   ];
+  if (truncated) lines.push(runDir ? `Full result: ${runDir}/run.json` : "(result truncated)");
   if (task.status === "failed") {
+    // The runtime's own "Re-run without resumeFromRunId" (a resume label that was replayed) must not be contradicted.
+    const resumable = task.agentCount > 0 && !/without resumeFromRunId/.test(result);
     lines.push(
       "",
       "Fix the script or `args` and call SubagentWorkflow again" +
-        (task.agentCount > 0 ? `, with resumeFromRunId: "${task.id}" to reuse the agent calls that settled.` : "."),
+        (resumable ? `, with the same \`args\` and resumeFromRunId: "${task.id}" to reuse the agent calls that settled.` : "."),
     );
   }
   return lines.filter(line => line !== undefined).join("\n");
