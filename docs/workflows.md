@@ -31,12 +31,13 @@ You do not have to say "workflow" — the model picks the tool — but saying it
 
 ### 2. Read what came back
 
-The tool returns immediately. The run continues in the background and notifies you when it is done.
+The tool returns as soon as the first agent starts (at most about 2 s). The run continues in the background and notifies you when it is done. A script that fails before then, typically on its first lines over bad `args`, returns its error here instead (`Workflow "…" failed after 0.1s. Nothing is running in the background.`), and a run with no agents that finishes inside that window returns its result here; neither sends a notification.
 
 ```text
 Workflow "auth-audit" started in the background.
 Task ID: wf_9f3ab21c04de
 Script: /var/folders/xy/…/pi-subagents-501/Users-me-project/<session>/tasks/wf_9f3ab21c04de.workflow.js
+Journal: /var/folders/xy/…/pi-subagents-501/Users-me-project/<session>/tasks/wf_9f3ab21c04de.workflow.jsonl
 
 You will be notified when it finishes — do NOT poll or sleep waiting for it.
 To iterate, edit the script file and call SubagentWorkflow again with scriptPath.
@@ -363,6 +364,9 @@ Recognize it by `await workflow('repo-map', { … })`. Reach for it to reuse som
 See [`compose.js`](../examples/workflows/compose.js).
 
 ## Troubleshooting
+
+**The call came back as `failed after …` instead of `started`.**
+The script threw before its first agent started: usually `args` was not the data the script expected (a placeholder, a string where a list belongs). Nothing is running. Fix the script or `args` and call again; if some agent calls had already settled, the message names the run id to pass as `resumeFromRunId`.
 
 **The run failed with `… is unavailable in workflow scripts (breaks resume)`.**
 The script called `Date.now()`, `new Date()` or `Math.random()`. A script that varies run to run cannot be replayed from its journal, so these throw. Use the loop index for ids, pass timestamps in through `args`, or stamp them after the workflow returns. This most often bites pasted-in helper code, and it throws at the line that calls it — *after* you have already paid for the preceding agents.

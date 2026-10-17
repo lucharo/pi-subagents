@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`subagent-workflows` skill, shipped with the package** (`skills/subagent-workflows/SKILL.md`, listed under `pi.skills`). Pi loads it before a model writes or reruns a `SubagentWorkflow` script: data goes in `args` as real JSON, the script validates it before any `agent()`, one script holds the whole sweep, and a failed run is edited and resumed with `resumeFromRunId` rather than relaunched or hand-merged.
+
+### Changed
+- **`SubagentWorkflow` fails fast.** The call holds its result until the first live agent starts, the run settles, or about 2 s pass. A script that throws on its first lines (bad `args`, a typo) now fails in the tool result instead of in a notification that arrives after the model has moved on, and a run that finishes inside the window returns its result directly with no notification. Everything after the first agent starts still runs in the background.
+
 ## [0.19.0-fluide.1] - 2026-10-14 (fork: lucharo/pi-subagents, branch `fluide`)
 
 Additions on top of 0.19.0 so another extension (fluide, the Pi desktop app) can draw workflow runs.

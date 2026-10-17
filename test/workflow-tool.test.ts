@@ -28,6 +28,7 @@ import type { AgentRecord } from "../src/types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
+import { workflowHandoff } from "../src/workflow/task.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 /* ------------------------------------------------------------------------- *
@@ -70,7 +71,8 @@ function stubManager(
       return { id: settled.id, record: settled };
     },
   );
-  return { manager: { spawnAndWait, abort, resume } as unknown as AgentManager, spawnAndWait, abort, resume };
+  const getRecord = vi.fn(() => undefined);
+  return { manager: { spawnAndWait, abort, resume, getRecord } as unknown as AgentManager, spawnAndWait, abort, resume };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({
@@ -648,20 +650,25 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     tools = booted.tools;
   });
 
+  const handoffMs = workflowHandoff.ms;
   afterEach(async () => {
-    // Let any detached run settle before the temp dir disappears under it.
+    workflowHandoff.ms = handoffMs;
+    // Stop any run still going, and let it settle before the temp dir disappears under it.
+    await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
     await flush();
     hermetic.restore();
     vi.restoreAllMocks();
   });
 
   const workflowCtx = () => ctx({ cwd: hermetic.dir });
+  /** A script that never returns: only the handoff window or an abort ends the call. */
+  const neverEnding = `${inlineScript}await new Promise(() => {});\n`;
 
   it("runs the inline script when only `script` is given, and persists it", async () => {
     const result = await tools.get("SubagentWorkflow").execute("tc-1", { script: inlineScript }, undefined, undefined, workflowCtx());
 
     const text = textOf(result);
-    expect(text).toMatch(/Workflow "from-inline" started/);
+    expect(text).toMatch(/Workflow "from-inline" completed/);
     const scriptLine = text.split("\n").find((line: string) => line.startsWith("Script: "));
     expect(scriptLine, "the persisted script path is what makes iteration edit-then-rerun").toBeTruthy();
     expect(existsSync(scriptLine!.slice("Script: ".length))).toBe(true);
@@ -677,7 +684,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       undefined, undefined, workflowCtx(),
     );
 
-    expect(textOf(result)).toMatch(/Workflow "from-file" started/);
+    expect(textOf(result)).toMatch(/Workflow "from-file" completed/);
     expect(textOf(result)).not.toMatch(/from-inline/);
   });
 
@@ -691,7 +698,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       undefined, undefined, workflowCtx(),
     );
 
-    expect(textOf(result)).toMatch(/Workflow "from-file" started/);
+    expect(textOf(result)).toMatch(/Workflow "from-file" completed/);
   });
 
   it("reports a missing scriptPath instead of silently falling back to `script`", async () => {
@@ -722,7 +729,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     );
 
     const text = textOf(result);
-    expect(text).toMatch(/Workflow "from-file" started/);
+    expect(text).toMatch(/Workflow "from-file" completed/);
     // Reported as its own file, so editing and re-running works on a saved one.
     expect(text).toContain(join(".pi", "workflows", "nightly.js"));
   });
@@ -736,7 +743,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       { script: inlineScript, name: "nightly" },
       undefined, undefined, workflowCtx(),
     );
-    expect(textOf(viaScript)).toMatch(/Workflow "from-inline" started/);
+    expect(textOf(viaScript)).toMatch(/Workflow "from-inline" completed/);
   });
 
   it("names the saved workflows it does have when the name is unknown", async () => {
@@ -765,7 +772,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       { name: "shared" },
       undefined, undefined, workflowCtx(),
     );
-    expect(textOf(fromGlobal)).toMatch(/Workflow "from-file" started/);
+    expect(textOf(fromGlobal)).toMatch(/Workflow "from-file" completed/);
 
     // Same name in the project wins — .pi stays the project authority.
     mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
@@ -776,7 +783,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       { name: "shared" },
       undefined, undefined, workflowCtx(),
     );
-    expect(textOf(fromProject)).toMatch(/Workflow "from-inline" started/);
+    expect(textOf(fromProject)).toMatch(/Workflow "from-inline" completed/);
   });
 
   it("refuses a file in the folder that is not a workflow", async () => {
@@ -861,9 +868,10 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   });
 
   it("refuses to resume a run that is still going", async () => {
+    workflowHandoff.ms = 20;
     const started = await tools.get("SubagentWorkflow").execute(
       "tc-resume-2",
-      { script: inlineScript },
+      { script: neverEnding },
       undefined, undefined, workflowCtx(),
     );
     const runId = (started.details as { taskId: string }).taskId;
@@ -878,6 +886,8 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   });
 
   it("accepts a settled run and says plainly that there was nothing to replay", async () => {
+    // A script with no agents settles inside the handoff window, so the first
+    // call already returns a settled run that can be resumed.
     const started = await tools.get("SubagentWorkflow").execute(
       "tc-resume-4",
       { script: inlineScript },
@@ -885,24 +895,16 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     );
     const runId = (started.details as { taskId: string }).taskId;
 
-    // The run is detached: it has to actually settle before it can be resumed,
-    // and the worker thread takes a moment to start, compile and finish.
-    let result: any;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      await flush();
-      result = await tools.get("SubagentWorkflow").execute(
-        `tc-resume-5-${attempt}`,
-        { script: inlineScript, resumeFromRunId: runId },
-        undefined, undefined, workflowCtx(),
-      );
-      if (!/is still running/.test(textOf(result))) break;
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-resume-5",
+      { script: inlineScript, resumeFromRunId: runId },
+      undefined, undefined, workflowCtx(),
+    );
 
     // That script spawns no agents, so its journal is empty. Saying so beats
     // reporting a resume that silently replayed nothing.
     expect(textOf(result)).toMatch(new RegExp(`Nothing to replay from ${runId}`));
-    expect(textOf(result)).toMatch(/started in the background/);
+    expect(textOf(result)).toMatch(/completed in/);
   });
 
   it("ignores title and description rather than rejecting them", async () => {
@@ -914,7 +916,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       undefined, undefined, workflowCtx(),
     );
 
-    expect(textOf(result)).toMatch(/Workflow "from-inline" started/);
+    expect(textOf(result)).toMatch(/Workflow "from-inline" completed/);
   });
 
   it("reports a bad `meta` up front rather than as a background run that failed", async () => {
@@ -934,29 +936,21 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(String(line)).toContain("from-inline");
   });
 
-  it("actually runs the script in the background and notifies through the agent channel", async () => {
+  it("returns a run that settles inside the handoff window as its own result, with no notification", async () => {
     const script = `${inlineScript}log("scanned 3 files");\nreturn "done here";\n`;
     const result = await tools.get("SubagentWorkflow").execute("tc-run", { script }, undefined, undefined, workflowCtx());
-    const taskId = /Task ID: (\S+)/.exec(textOf(result))?.[1];
-    expect(taskId).toBeTruthy();
 
-    // The tool returned before the run finished — the completion has to arrive
-    // on its own, through the same channel a background agent uses.
-    await vi.waitFor(
-      () =>
-        expect(
-          booted.pi.sendMessage.mock.calls.some((c: any[]) => String(c[0]?.content).includes(taskId!)),
-        ).toBe(true),
-      { timeout: 10_000 },
-    );
+    const text = textOf(result);
+    expect(text).toMatch(/Workflow "from-inline" completed in/);
+    expect(text).toMatch(/No notification will follow/);
+    expect(text).toContain("done here");
+    expect(text).not.toMatch(/started in the background/);
 
-    const sent = booted.pi.sendMessage.mock.calls.find((c: any[]) => String(c[0]?.content).includes(taskId!))!;
-    expect(sent[0].customType).toBe("subagent-notification");
-    expect(sent[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
-    expect(String(sent[0].content)).toContain("<result>done here</result>");
+    // The result was already handed over, so a notification would repeat it and trigger a turn for nothing.
+    await flush();
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
 
-    // …and the inline card follows the background run rather than freezing at
-    // whatever `execute` returned.
+    // The card is the settled run's, not a frozen "starting" row.
     const card = String(
       tools.get("SubagentWorkflow")
         .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false })
@@ -964,7 +958,18 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     );
     expect(card).toContain("from-inline");
     expect(card).toContain("scanned 3 files");
-    expect(card).toContain("done");
+  });
+
+  it("hands a run that outlives the window to the background, and notifies when it settles", async () => {
+    workflowHandoff.ms = 20;
+    const result = await tools.get("SubagentWorkflow").execute("tc-bg", { script: neverEnding }, undefined, undefined, workflowCtx());
+    expect(textOf(result)).toMatch(/started in the background/);
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
+
+    await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
+    const sent = await awaitNotification(startedTaskId(result));
+    expect(sent[0].customType).toBe("subagent-notification");
+    expect(sent[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
   });
 
   /** Wait for the completion notification a background run sends for `taskId`. */
@@ -982,11 +987,12 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   const startedTaskId = (result: unknown) => /Task ID: (\S+)/.exec(textOf(result))![1];
 
   it("kills a still-running workflow (and its worker thread) on session shutdown", async () => {
+    workflowHandoff.ms = 20;
     // A never-returning script: only the run's own abort signal can stop it, so
     // abortAll() over the agent records would leave the worker spinning.
     const result = await tools.get("SubagentWorkflow").execute(
       "tc-shutdown",
-      { script: `${inlineScript}await new Promise(() => {});\n` },
+      { script: neverEnding },
       undefined, undefined, workflowCtx(),
     );
 
@@ -996,22 +1002,43 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(String(sent[0].content)).toContain("<status>Stopped</status>");
   });
 
-  it("reports a script that threw, rather than a run that quietly ended", async () => {
+  it("returns a script that threw before any agent as the tool's error, not a later notification", async () => {
     const result = await tools.get("SubagentWorkflow").execute(
       "tc-throw",
       { script: `${inlineScript}throw new Error("script blew up");\n` },
       undefined, undefined, workflowCtx(),
     );
 
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Error:");
-    expect(sent[0].details).toMatchObject({ status: "error" });
-    // The reason has to be the *result* too, not only the status line — that is
-    // what the collapsed notification row shows.
-    expect(String(sent[0].details.resultPreview)).toContain("script blew up");
+    const text = textOf(result);
+    expect(text).toMatch(/Workflow "from-inline" failed after/);
+    expect(text).toMatch(/Nothing is running in the background/);
+    expect(text).toContain("Error: script blew up");
+    expect(text).not.toMatch(/started in the background/);
+    await flush();
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("reports a run that could not start at all", async () => {
+  it("fails fast on a placeholder in `args` that the script cannot use (16 Oct incident)", async () => {
+    // The agent passed a placeholder object where the shard lists belonged; the
+    // script threw on its first line while the tool said "started", and the
+    // agent launched a second run before the failure notice arrived.
+    const script =
+      `${inlineScript}const SHARDS = args.shards;\n` +
+      `const files = Object.keys(SHARDS).map(k => (SHARDS[k] || []).join(","));\n` +
+      `return await agent("read " + files[0]);\n`;
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-args",
+      { script, args: { shards: { __file: "see below" } } },
+      undefined, undefined, workflowCtx(),
+    );
+
+    const text = textOf(result);
+    expect(text).toMatch(/failed after/);
+    expect(text).toMatch(/join is not a function/);
+    expect(text).toMatch(/Fix the script or `args`/);
+  });
+
+  it("returns a run that could not start at all as the tool's error", async () => {
     // A control character is rejected before the worker is created, so this
     // never reaches the run's own error path.
     const result = await tools.get("SubagentWorkflow").execute(
@@ -1020,9 +1047,10 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       undefined, undefined, workflowCtx(),
     );
 
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("control characters");
-    expect(sent[0].details).toMatchObject({ status: "error" });
+    expect(textOf(result)).toMatch(/failed after/);
+    expect(textOf(result)).toContain("control characters");
+    await flush();
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
   });
 });
 

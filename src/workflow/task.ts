@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import { collapse, elapsedMs, formatDuration, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -316,4 +316,46 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     `<usage><total_tokens>${task.totalTokens}</total_tokens><tool_uses>${task.totalToolCalls}</tool_uses><duration_ms>${elapsedMs(task, now)}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join("\n");
+}
+
+/**
+ * How long a `SubagentWorkflow` call holds its result before handing the run to the background.
+ *
+ * The call returns as soon as the first live agent starts, the run settles, or this many milliseconds pass, whichever
+ * is first. A script that throws on its first lines (a placeholder in `args`, a typo) therefore fails inside the tool
+ * result, where the model fixes it in the same turn, instead of as a notification that lands after it has moved on.
+ * An object rather than a constant so tests can shorten it.
+ */
+export const workflowHandoff = { ms: 2000 };
+
+/** Whether this progress batch shows an agent actually starting, as opposed to queuing or replaying from a journal. */
+export function startsLiveAgent(entries: readonly WorkflowEntry[]): boolean {
+  return entries.some(entry => entry.type === "workflow_agent" && entry.startedAt !== undefined && !entry.cached);
+}
+
+/** The tool result for a run that settled before it was handed to the background: no notification follows it. */
+export function formatSettledEarly(task: WorkflowTask, now = Date.now()): string {
+  const name = task.workflowName ?? task.id;
+  const took = formatDuration(elapsedMs(task, now));
+  const head =
+    task.status === "completed" ? `Workflow "${name}" completed in ${took}.`
+    : task.status === "killed" ? `Workflow "${name}" was stopped after ${took}.`
+    : `Workflow "${name}" failed after ${took}. Nothing is running in the background.`;
+  const lines = [
+    `${head} No notification will follow.`,
+    `Task ID: ${task.id}`,
+    task.scriptPath ? `Script: ${task.scriptPath}` : undefined,
+    task.journalPath ? `Journal: ${task.journalPath}` : undefined,
+    task.replayedCount > 0 ? `Replayed ${task.replayedCount} recorded call(s) from ${task.resumedFrom ?? "an earlier run"}.` : undefined,
+    "",
+    task.status === "failed" ? `Error: ${workflowResultText(task)}` : `Result:\n${workflowResultText(task)}`,
+  ];
+  if (task.status === "failed") {
+    lines.push(
+      "",
+      "Fix the script or `args` and call SubagentWorkflow again" +
+        (task.agentCount > 0 ? `, with resumeFromRunId: "${task.id}" to reuse the agent calls that settled.` : "."),
+    );
+  }
+  return lines.filter(line => line !== undefined).join("\n");
 }

@@ -71,7 +71,7 @@ import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { type WorkflowChildInfo, type WorkflowToolCall, workflowSnapshot } from "./workflow/snapshot.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatSettledEarly, formatWorkflowNotification, resolveResumeTarget, startsLiveAgent, updateWorkflowProgressBatch, type WorkflowTask, workflowHandoff, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -2516,9 +2516,10 @@ Terse command-style prompts produce shallow, generic work.
    * Run a task to completion against the real manager, settling the record
    * either way. Never rejects: a run that cannot start (bad `meta`, oversized
    * source, non-JSON `args`) is a failed workflow, and both callers here are
-   * detached — a rejection would surface as an unhandled one.
+   * detached — a rejection would surface as an unhandled one. `onLiveAgent` fires
+   * on every progress batch in which an agent actually starts (not one replayed).
    */
-  async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
+  async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask, onLiveAgent?: () => void): Promise<void> {
     try {
       const result = await runWorkflow({
         script: task.script,
@@ -2534,7 +2535,11 @@ Terse command-style prompts produce shallow, generic work.
           onChildSession: (recordId, session, prompt) => onWorkflowChild(ctx, task, recordId, session, prompt),
           onChildResume: (recordId, session) => onWorkflowChildResume(ctx, task, recordId, session),
         }),
-        onProgress: entries => { updateWorkflowProgressBatch(task, entries); publishWorkflow(task); },
+        onProgress: entries => {
+          updateWorkflowProgressBatch(task, entries);
+          publishWorkflow(task);
+          if (onLiveAgent && startsLiveAgent(entries)) onLiveAgent();
+        },
         // The dialog's pause / skip / retry keys run through this; it is dropped
         // again when the task settles.
         onControl: control => { task.control = control; },
@@ -2738,9 +2743,38 @@ Terse command-style prompts produce shallow, generic work.
       widget.update();
       fleet.update();
 
-      // Background, like Claude Code: the id comes back now and the run keeps
-      // going without the tool call.
-      void runWorkflowTask(ctx, task).then(() => notifyWorkflowFinished(task));
+      // Held until the first live agent starts, the run settles, or the handoff
+      // window passes. A script that throws on its first lines then fails in this
+      // result, where the model fixes it in the same turn; a notification would
+      // land after it had already moved on (and, in practice, relaunched).
+      let liveStarted!: () => void;
+      const live = new Promise<"live">(resolve => { liveStarted = () => resolve("live"); });
+      const settled = runWorkflowTask(ctx, task, () => liveStarted());
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const first = await Promise.race([
+        settled.then(() => "settled" as const),
+        live,
+        new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), workflowHandoff.ms); }),
+      ]);
+      clearTimeout(timer);
+      const nothingToReplay =
+        task.resumedFrom === undefined && params.resumeFromRunId !== undefined
+          ? `Nothing to replay from ${params.resumeFromRunId} — every agent runs live.\n`
+          : "";
+      // Settled in the same tick its first agent started: still an inline result.
+      if (first === "settled" || task.endTime !== undefined) {
+        await settled;
+        widget.update();
+        fleet.update();
+        return {
+          content: [{ type: "text" as const, text: nothingToReplay + formatSettledEarly(task) }],
+          details: { taskId: runId },
+        };
+      }
+
+      // Background from here, like Claude Code: the run keeps going without the
+      // tool call and reports back through the agent notification channel.
+      void settled.then(() => notifyWorkflowFinished(task));
 
       return {
         content: [{
@@ -2749,11 +2783,10 @@ Terse command-style prompts produce shallow, generic work.
             `Workflow "${meta.name}" started in the background.\n` +
             `Task ID: ${runId}\n` +
             (task.scriptPath ? `Script: ${task.scriptPath}\n` : "") +
+            (task.journalPath ? `Journal: ${task.journalPath}\n` : "") +
             (task.resumedFrom !== undefined
               ? `Resuming ${task.resumedFrom}: ${task.replay?.length ?? 0} recorded call(s) available to replay.\n`
-              : params.resumeFromRunId !== undefined
-                ? `Nothing to replay from ${params.resumeFromRunId} — every agent runs live.\n`
-                : "") +
+              : nothingToReplay) +
             `\nYou will be notified when it finishes — do NOT poll or sleep waiting for it.\n` +
             `To iterate, edit the script file and call SubagentWorkflow again with scriptPath.`,
         }],

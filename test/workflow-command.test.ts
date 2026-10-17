@@ -14,6 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import subagentsExtension from "../src/index.js";
+import { workflowHandoff } from "../src/workflow/task.js";
 import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
 /** Boot the real extension and hand back its `/agents` command. */
@@ -138,13 +139,24 @@ describe("/agents → Workflows", () => {
   });
 
   describe("with runs in the session", () => {
+    // Runs that never return, handed to the background after a short window, so
+    // the dialog has a live run to stop and pause.
     const script = (name: string) =>
-      `export const meta = { name: "${name}", description: "d" };\nreturn 1;\n`;
+      `export const meta = { name: "${name}", description: "d" };\nawait new Promise(() => {});\n`;
+    const handoffMs = workflowHandoff.ms;
+    let shutdown: (() => Promise<void>) | undefined;
+    beforeEach(() => { workflowHandoff.ms = 10; });
+    afterEach(async () => {
+      workflowHandoff.ms = handoffMs;
+      await shutdown?.();
+      shutdown = undefined;
+    });
 
     /** Boot, then start `count` workflows so the session has tasks to inspect. */
     async function withRuns(count: number) {
       const booted = bootCommand();
       const runCtx = ctx({ cwd: hermetic.dir });
+      shutdown = async () => { await booted.lifecycle.get("session_shutdown")?.({}, runCtx); };
       for (let i = 0; i < count; i++) {
         await booted.tools.get("SubagentWorkflow").execute(`tc-${i}`, { script: script(`wf-${i}`) }, undefined, undefined, runCtx);
       }

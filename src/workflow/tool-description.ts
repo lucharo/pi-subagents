@@ -20,6 +20,8 @@
  *   - `parallel` propagates a fatal run error instead of folding it to null.
  *   - `effort` inherits the agent definition's level, then the parent's.
  *   - `isolation` removes the worktree on settle, changes kept on a branch.
+ *   - the call holds its result until the first live agent starts (at most
+ *     ~2 s), so a script that throws on its first lines fails in the result.
  * Additions with no upstream counterpart: `gate`, `resume`, `effort: "minimal"`,
  * the saved-workflow directories, and the reject-unknown-options guarantee.
  *
@@ -36,7 +38,7 @@
  * `agent()` option set, the `resume` exclusions, the effort levels, the caps,
  * and that every example here uses options the runtime actually accepts.
  */
-export const fullWorkflowToolDescription = `Execute a workflow script that orchestrates multiple subagents deterministically. Workflows run in the background — this tool returns immediately with a task ID, and you are notified when the workflow completes. Use /agents → Workflows to watch live progress.
+export const fullWorkflowToolDescription = `Execute a workflow script that orchestrates multiple subagents deterministically. Workflows run in the background — this tool returns with a task ID as soon as the first agent starts (a script that fails before then returns its error here instead), and you are notified when the workflow completes. Use /agents → Workflows to watch live progress.
 
 A workflow structures work across many agents — to be comprehensive (decompose and cover in parallel), to be confident (independent perspectives and adversarial checks before committing), or to take on scale one context can't hold (migrations, audits, broad sweeps). The script is where you encode that structure: what fans out, what verifies, what synthesizes.
 
