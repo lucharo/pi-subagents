@@ -2520,21 +2520,24 @@ Terse command-style prompts produce shallow, generic work.
    * on every progress batch in which an agent actually starts (not one replayed).
    */
   async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask, onLiveAgent?: () => void): Promise<void> {
+    // The host holds every child it spawns on the manager, so a script can
+    // resume one long after it finished; released below once the run settles.
+    const host = createWorkflowHost({
+      pi,
+      ctx,
+      manager,
+      signal: task.abortController.signal,
+      rootSessionId: ctx.sessionManager.getSessionId(),
+      workflowId: task.id,
+      onChildSession: (recordId, session, prompt) => onWorkflowChild(ctx, task, recordId, session, prompt),
+      onChildResume: (recordId, session) => onWorkflowChildResume(ctx, task, recordId, session),
+    });
     try {
       const result = await runWorkflow({
         script: task.script,
         args: task.args,
         signal: task.abortController.signal,
-        host: createWorkflowHost({
-          pi,
-          ctx,
-          manager,
-          signal: task.abortController.signal,
-          rootSessionId: ctx.sessionManager.getSessionId(),
-          workflowId: task.id,
-          onChildSession: (recordId, session, prompt) => onWorkflowChild(ctx, task, recordId, session, prompt),
-          onChildResume: (recordId, session) => onWorkflowChildResume(ctx, task, recordId, session),
-        }),
+        host,
         onProgress: entries => {
           updateWorkflowProgressBatch(task, entries);
           publishWorkflow(task);
@@ -2553,6 +2556,10 @@ Terse command-style prompts produce shallow, generic work.
       completeWorkflowTask(task, result);
     } catch (err) {
       failWorkflowTask(task, err instanceof Error ? err.message : String(err));
+    } finally {
+      // Done, failed or stopped alike: nothing can resume these children now,
+      // so they go back to the manager's ten-minute rule from this moment.
+      host.release();
     }
     settleWorkflowSnapshot(ctx, task);
   }

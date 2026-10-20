@@ -72,7 +72,15 @@ function stubManager(
     },
   );
   const getRecord = vi.fn(() => undefined);
-  return { manager: { spawnAndWait, abort, resume, getRecord } as unknown as AgentManager, spawnAndWait, abort, resume };
+  // The host holds every child on the manager for as long as its run lives.
+  const hold = vi.fn(() => true);
+  const releaseAll = vi.fn();
+  return {
+    manager: { spawnAndWait, abort, resume, getRecord, hold, releaseAll } as unknown as AgentManager,
+    spawnAndWait,
+    abort,
+    resume,
+  };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({
