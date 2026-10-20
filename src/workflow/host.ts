@@ -190,6 +190,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
   /** Who holds this run's records on the manager — see `release()`. */
   const holdOwner = `${deps.workflowId ?? "workflow"}#${++hostSequence}`;
   /**
+   * Set by `release()`. A stopped run can settle while a child is still in
+   * startup (creating its worktree): that child's spawn callback then fires
+   * after the release, and a hold taken then would never be handed back.
+   */
+  let released = false;
+  /**
    * scopeModels warnings already toasted, so a fan-out that pins one
    * out-of-scope agent file raises one notification rather than one per child.
    * Kept for the whole run: the same message is the same warning at agent 200
@@ -372,7 +378,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
             records.set(request.agentId, id);
             // Held from the moment it exists, so `resume` can still reach it
             // however long the script takes to come back to it.
-            manager.hold(id, holdOwner);
+            if (!released) manager.hold(id, holdOwner);
             // Ahead of `reportResolved`, and not folded into it: that one waits
             // for the child's session so it can name the effective model, while
             // the record id is known here and is what the inspector opens a
@@ -442,6 +448,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
     },
 
     release() {
+      released = true;
       manager.releaseAll(holdOwner);
     },
   };

@@ -126,6 +126,28 @@ describe("a live workflow run keeps the records it may resume", () => {
     expect(manager.getRecord(id)).toBeUndefined();
   });
 
+  it("takes no hold for a child whose startup finishes after the run was released", async () => {
+    // A stopped run settles without waiting for a child still creating its
+    // worktree; that child's spawn callback fires after `release()`. Simulated by
+    // deferring the callback the host passes to the manager.
+    const original = manager.spawnAndWait.bind(manager);
+    let late: (() => void) | undefined;
+    vi.spyOn(manager, "spawnAndWait").mockImplementation((pi, c, type, prompt, options, onSpawned) =>
+      original(pi, c, type, prompt, options, id => {
+        late = () => onSpawned?.(id);
+      }),
+    );
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    const id = await spawnThrough(host, "wf-agent-0");
+
+    host.release();
+    expect(late).toBeDefined();
+    late!();
+
+    await vi.advanceTimersByTimeAsync(11 * MINUTE);
+    expect(manager.getRecord(id)).toBeUndefined();
+  });
+
   it("refuses to hold a record the manager does not know", () => {
     expect(manager.hold("no-such-agent", "wf-1")).toBe(false);
   });
