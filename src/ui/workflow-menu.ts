@@ -118,12 +118,12 @@ export async function showWorkflowDialog(
           },
           onOpenAgent: recordId => {
             const record = deps.getRecord(recordId);
-            // A run's children are records like any other, so they are swept
-            // ten minutes after they finish — the row outlives the
+            // A run's children are held while the run lives, then swept like
+            // any other record ten minutes after it ends — the row outlives the
             // conversation it points at, and saying why beats an overlay that
             // opens empty.
             if (record === undefined) {
-              ctx.ui.notify("No conversation left — agent records are dropped ten minutes after they finish.", "info");
+              ctx.ui.notify("No conversation left — a run's agent records are dropped ten minutes after the run ends.", "info");
               return;
             }
             overlay?.setHidden(true);

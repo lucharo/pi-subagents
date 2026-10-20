@@ -30,6 +30,11 @@
  *     settle, and the verdict travels back on the spawn result. `runGate` still
  *     exists for a child that had no worktree; the runtime uses whichever of
  *     the two happened, never both.
+ *   - **how long a finished child stays resumable.** The manager drops finished
+ *     records ten minutes after they settle, but a script may resume a child
+ *     much later (fix, then a long review, then resume the fixer). So every
+ *     child is held on the manager for as long as the run lives, and the
+ *     caller hands the holds back with `release()` once the run settles.
  */
 
 import { existsSync } from "node:fs";
@@ -165,10 +170,25 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
 const GATE_SHELL: readonly [string, string] =
   process.platform === "win32" ? ["cmd", "/c"] : ["sh", "-c"];
 
-export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
+/** A host plus the one call its owner makes when the run is over. */
+export interface WorkflowHostHandle extends WorkflowHost {
+  /**
+   * Hand back every record this run held. Call once the run has settled, done,
+   * failed or stopped: from then on its children fall under the manager's
+   * normal ten-minute rule, counted from this moment.
+   */
+  release(): void;
+}
+
+/** Makes each host's hold owner unique, even across reruns of one workflow id. */
+let hostSequence = 0;
+
+export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandle {
   const { pi, ctx, manager } = deps;
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
+  /** Who holds this run's records on the manager — see `release()`. */
+  const holdOwner = `${deps.workflowId ?? "workflow"}#${++hostSequence}`;
   /**
    * scopeModels warnings already toasted, so a fan-out that pins one
    * out-of-scope agent file raises one notification rather than one per child.
@@ -350,6 +370,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           id => {
             spawnedId = id;
             records.set(request.agentId, id);
+            // Held from the moment it exists, so `resume` can still reach it
+            // however long the script takes to come back to it.
+            manager.hold(id, holdOwner);
             // Ahead of `reportResolved`, and not folded into it: that one waits
             // for the child's session so it can name the effective model, while
             // the record id is known here and is what the inspector opens a
@@ -388,7 +411,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (record === undefined) {
         return {
           ok: false,
-          error: `Agent ${id} has no session left to resume — records are dropped ten minutes after they finish.`,
+          error: `Agent ${id} has no session left to resume — it never started a session, or a session change cleared it.`,
         };
       }
       // The resumed row is built from scratch, so it has to be told the same
@@ -416,6 +439,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // The child's worktree when it had one and it survived; otherwise the
       // session's own directory, which is where a non-isolated child worked.
       return await executeGate(command, gate.cwd ?? ctx.cwd);
+    },
+
+    release() {
+      manager.releaseAll(holdOwner);
     },
   };
 }

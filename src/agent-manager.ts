@@ -393,6 +393,23 @@ export class AgentManager {
   private tombstones = new Map<string, AgentTombstone>();
 
   /**
+   * Finished records someone still needs, keyed by record id, with who needs
+   * them. A live workflow run holds every child it spawned: its script may
+   * `agent(prompt, { resume })` one of them at any point, and a fix → review →
+   * resume loop routinely spends more than ten minutes between the fixer
+   * finishing and the resume. `cleanup()` skips a held record; `clearCompleted()`
+   * does not, because a session boundary ends the run that held it anyway.
+   */
+  private holds = new Map<string, Set<string>>();
+
+  /**
+   * When the last hold on a record was released. The ten-minute window restarts
+   * from here rather than from `completedAt`, so a record released after a long
+   * run is not swept on the very next tick.
+   */
+  private releasedAt = new Map<string, number>();
+
+  /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
    * both pools: `drainQueue` picks the earliest entry whose own pool has room,
    * so neither can head-of-line-block the other, and every removal path
@@ -635,6 +652,8 @@ export class AgentManager {
           this.onComplete?.(record);
         } else {
           this.agents.delete(id);
+          this.holds.delete(id);
+          this.releasedAt.delete(id);
         }
         // The agent never kept its slot (startAgent gives it back on failure),
         // so anything queued behind it can go now.
@@ -1425,8 +1444,41 @@ export class AgentManager {
     return true;
   }
 
+  /**
+   * Keep a record out of the ten-minute cleanup until `owner` releases it.
+   * Returns false for an id the manager does not know, so a late hold cannot
+   * leak an entry for a record that is already gone.
+   */
+  hold(id: string, owner: string): boolean {
+    if (!this.agents.has(id)) return false;
+    let owners = this.holds.get(id);
+    if (!owners) {
+      owners = new Set();
+      this.holds.set(id, owners);
+    }
+    owners.add(owner);
+    this.releasedAt.delete(id);
+    return true;
+  }
+
+  /**
+   * Drop every hold `owner` placed. A record nobody else holds goes back to the
+   * normal rule: removed ten minutes after it finished, or after this moment,
+   * whichever is later.
+   */
+  releaseAll(owner: string): void {
+    const now = Date.now();
+    for (const [id, owners] of this.holds) {
+      if (!owners.delete(owner) || owners.size > 0) continue;
+      this.holds.delete(id);
+      this.releasedAt.set(id, now);
+    }
+  }
+
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
+    this.holds.delete(id);
+    this.releasedAt.delete(id);
     this.tombstone(record);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
@@ -1471,7 +1523,8 @@ export class AgentManager {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
-      if ((record.completedAt ?? 0) >= cutoff) continue;
+      if (this.holds.has(id)) continue;
+      if (Math.max(record.completedAt ?? 0, this.releasedAt.get(id) ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
   }
@@ -1483,6 +1536,8 @@ export class AgentManager {
    * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
    */
   clearCompleted(skipUnconsumed = false): void {
+    // Held records are cleared too: a session boundary ends the workflow run
+    // that held them, so there is no script left to resume them.
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
@@ -1562,6 +1617,8 @@ export class AgentManager {
     const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
     this.startups.clear();
+    this.holds.clear();
+    this.releasedAt.clear();
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited
