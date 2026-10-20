@@ -397,8 +397,8 @@ export class AgentManager {
    * them. A live workflow run holds every child it spawned: its script may
    * `agent(prompt, { resume })` one of them at any point, and a fix → review →
    * resume loop routinely spends more than ten minutes between the fixer
-   * finishing and the resume. `cleanup()` skips a held record; `clearCompleted()`
-   * does not, because a session boundary ends the run that held it anyway.
+   * finishing and the resume. Both `cleanup()` and `clearCompleted()` skip a
+   * held record; `dispose()` does not.
    */
   private holds = new Map<string, Set<string>>();
 
@@ -1536,10 +1536,14 @@ export class AgentManager {
    * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
    */
   clearCompleted(skipUnconsumed = false): void {
-    // Held records are cleared too: a session boundary ends the workflow run
-    // that held them, so there is no script left to resume them.
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
+      // A held record belongs to a workflow run that is still alive. A real
+      // session end aborts that run (which releases it) and disposes every
+      // record, but `session_before_switch` also fires for a switch that is then
+      // cancelled, and the run carries on: clearing here would break its next
+      // resume. Once released, the ten-minute cleanup takes it.
+      if (this.holds.has(id)) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }

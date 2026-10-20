@@ -417,7 +417,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       if (record === undefined) {
         return {
           ok: false,
-          error: `Agent ${id} has no session left to resume — it never started a session, or a session change cleared it.`,
+          error: `Agent ${id} has no session to resume.`,
         };
       }
       // The resumed row is built from scratch, so it has to be told the same

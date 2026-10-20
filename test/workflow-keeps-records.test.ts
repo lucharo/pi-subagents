@@ -148,6 +148,23 @@ describe("a live workflow run keeps the records it may resume", () => {
     expect(manager.getRecord(id)).toBeUndefined();
   });
 
+  it("survives a session-boundary sweep while its run lives", async () => {
+    // `session_before_switch` clears completed records, and fires for a switch
+    // that is then cancelled; the run is still going and must still resume.
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    const id = await spawnThrough(host, "wf-agent-0");
+    manager.getRecord(id)!.resultConsumed = true;
+    const loose = manager.spawn(mockPi, ctx(), "general-purpose", "plain", { description: "plain", isBackground: true });
+    await manager.getRecord(loose)!.promise;
+
+    manager.clearCompleted();
+
+    expect(manager.getRecord(loose)).toBeUndefined();
+    expect(manager.getRecord(id)).toBeDefined();
+    const resumed = await host.resumeAgent("wf-agent-0", "findings");
+    expect(resumed).toMatchObject({ ok: true, text: "fixed the findings" });
+  });
+
   it("refuses to hold a record the manager does not know", () => {
     expect(manager.hold("no-such-agent", "wf-1")).toBe(false);
   });
