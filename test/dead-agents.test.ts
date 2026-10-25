@@ -15,12 +15,21 @@ vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
 }));
+// A worktree's wind-down (gate, cleanup) is where a finished run can hang; the
+// real git calls are not what these tests are about.
+vi.mock("../src/worktree.js", () => ({
+  isWorktreeIsolationEnabled: () => true,
+  createWorktree: vi.fn(async () => ({ path: "/tmp/wt", branch: "b", baseSha: "s", workPath: "/tmp/wt" })),
+  cleanupWorktree: vi.fn(async () => ({ hasChanges: false })),
+  pruneWorktrees: vi.fn(async () => {}),
+}));
 
-import { AgentManager, DEFAULT_STALL_LIMIT_MS, STOP_GRACE_MS, stalledMessage } from "../src/agent-manager.js";
+import { AgentManager, DEFAULT_STALL_LIMIT_MS, STOP_GRACE_MS, stalledMessage, WIND_DOWN_FLOOR_MS } from "../src/agent-manager.js";
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import type { AgentRecord } from "../src/types.js";
-import { createWorkflowHost } from "../src/workflow/host.js";
+import { createWorkflowHost, DEFAULT_GATE_TIMEOUT_MS } from "../src/workflow/host.js";
+import { cleanupWorktree } from "../src/worktree.js";
 import { ctx } from "./helpers/boot-extension.js";
 
 const MINUTE = 60_000;
@@ -257,5 +266,68 @@ describe("a run that stops responding is settled as failed", () => {
     expect(manager.getRecord(id)).toMatchObject({ status: "error", error: stalledMessage(DEFAULT_STALL_LIMIT_MS) });
     expect(completed.map(r => r.id)).toEqual([id]);
     await expect(manager.getRecord(id)!.promise).resolves.toBe("");
+  });
+
+  it("publishes a foreground resume's own turn as record.promise, so waiters wait on it", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: liveSession(), aborted: false, steered: false } as any);
+    const id = manager.spawn(mockPi, ctx(), "general-purpose", "p", { description: "p", isBackground: true });
+    await manager.getRecord(id)!.promise;
+    const turn = deferredRun();
+    vi.mocked(resumeAgent).mockImplementation(() => turn.promise);
+
+    const resumed = manager.resume(id, "again");
+    let settled = false;
+    void manager.getRecord(id)!.promise!.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+
+    turn.resolve({ text: "second" });
+    await resumed;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(true);
+    await expect(manager.getRecord(id)!.promise).resolves.toBe("second");
+  });
+
+  it("keeps a parent alive while a nested child it waits on is working", async () => {
+    let childOpts: any;
+    vi.mocked(runAgent).mockImplementation((_c, _t, prompt, o: any) => {
+      if (prompt === "child") childOpts = o;
+      return new Promise(() => {});
+    });
+    const parent = manager.spawn(mockPi, ctx(), "general-purpose", "parent", { description: "parent", isBackground: true });
+    const child = manager.spawn(mockPi, ctx(), "general-purpose", "child", { description: "child", parentAgentId: parent });
+
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(50 * MINUTE);
+      childOpts.onToolActivity({ type: "end", toolName: "bash" });
+    }
+    expect(manager.getRecord(parent)?.status).toBe("running");
+    expect(manager.getRecord(child)?.status).toBe("running");
+
+    // Once the child goes silent too, the parent is found out, and its child
+    // stops with it (whichever the sweep reached first).
+    await vi.advanceTimersByTimeAsync(61 * MINUTE);
+    expect(manager.getRecord(parent)?.status).toBe("error");
+    expect(manager.getRecord(child)?.status).not.toBe("running");
+  });
+
+  it("waits out a gate before settling a finished run whose wind-down hangs, then settles it as a failure", async () => {
+    expect(WIND_DOWN_FLOOR_MS).toBeGreaterThanOrEqual(2 * DEFAULT_GATE_TIMEOUT_MS);
+    manager.setStallLimitMs(5 * MINUTE);
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: liveSession(), aborted: false, steered: false } as any);
+    vi.mocked(cleanupWorktree).mockImplementationOnce(() => new Promise(() => {}));
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf_gate01" });
+    let ok: boolean | undefined;
+    const pending = host.spawnAgent({ agentId: "wf-agent-0", index: 0, prompt: "fix", label: "fix", agentType: "general-purpose", isolation: "worktree" })
+      .then(r => { ok = r.ok; return r; });
+
+    // Longer than the 5-minute limit, shorter than a gate may take: left alone.
+    await vi.advanceTimersByTimeAsync(WIND_DOWN_FLOOR_MS - MINUTE);
+    expect(ok).toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(2 * MINUTE);
+    // A failure, not the success it had: a success would run the gate again.
+    await expect(pending).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/^Stopped responding: its wind-down/) });
+    expect(stalled).toEqual([]);
   });
 });

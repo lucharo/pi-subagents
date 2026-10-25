@@ -89,6 +89,16 @@ export const DEFAULT_STALL_LIMIT_MS = 60 * 60_000;
  */
 export const STOP_GRACE_MS = 30_000;
 
+/**
+ * The shortest wind-down the stall check waits out for a run that has finished
+ * but not returned: a workflow `gate` runs there (bounded by its own timeout)
+ * before the worktree is cleaned up, and cutting it short would lose its
+ * verdict. Twice the gate's bound (`DEFAULT_GATE_TIMEOUT_MS` in workflow/host.ts,
+ * not imported to keep the workflow runtime out of the manager; a test pins the
+ * relation) leaves room for the cleanup after it.
+ */
+export const WIND_DOWN_FLOOR_MS = 20 * 60_000;
+
 /** The error a stalled agent is marked with. Starts with the words the UI shows. */
 export function stalledMessage(limitMs: number): string {
   const minutes = Math.max(1, Math.round(limitMs / 60_000));
@@ -544,12 +554,29 @@ export class AgentManager {
     return watch;
   }
 
+  /**
+   * A sign of life from `id`'s run. Passed up the owner chain too: a parent
+   * awaiting a nested child sits in one long tool call, writing nothing of its
+   * own, for as long as that child works.
+   */
+  private touchRun(id: string): void {
+    const now = Date.now();
+    const seen = new Set<string>();
+    for (let at: string | undefined = id; at !== undefined && !seen.has(at); at = this.agents.get(at)?.parentAgentId) {
+      seen.add(at);
+      const watch = this.watches.get(at);
+      if (watch && !watch.settled) watch.lastActivityAt = now;
+    }
+  }
+
   /** Count every event a session emits as a sign of life. */
-  private followSession(watch: RunWatch, session: AgentSession | undefined): void {
-    if (typeof session?.subscribe !== "function") return;
+  private followSession(id: string, watch: RunWatch, session: AgentSession | undefined): void {
+    // A session that arrives after the run was settled from outside belongs to
+    // nobody: following it would only keep a dead watch warm.
+    if (watch.settled || typeof session?.subscribe !== "function") return;
     watch.off?.();
     try {
-      watch.off = session.subscribe(() => { watch.lastActivityAt = Date.now(); });
+      watch.off = session.subscribe(() => this.touchRun(id));
     } catch { /* an older or stubbed session: the run's callbacks still count */ }
   }
 
@@ -596,7 +623,12 @@ export class AgentManager {
       } else if (record.status === "stopped") {
         if (now - (record.completedAt ?? now) < STOP_GRACE_MS) continue;
       } else if (record.status !== "queued") {
-        if (limit <= 0 || now - (record.completedAt ?? now) < limit) continue;
+        // Finished, but its wind-down never returned. Settled as a failure, not
+        // with the outcome it had: a gate cut short has no verdict, and a
+        // success here would have the workflow run the gate a second time.
+        if (limit <= 0 || now - (record.completedAt ?? now) < Math.max(limit, WIND_DOWN_FLOOR_MS)) continue;
+        record.status = "error";
+        record.error = `Stopped responding: its wind-down (gate, worktree cleanup) did not finish in ${Math.round(Math.max(limit, WIND_DOWN_FLOOR_MS) / 60_000)} min.`;
       } else continue;
       watch.settled = true;
       watch.off?.();
@@ -931,7 +963,7 @@ export class AgentManager {
       this.settleRun(record, true, pool);
       cutLoose();
     });
-    const touch = () => { watch.lastActivityAt = Date.now(); };
+    const touch = () => this.touchRun(id);
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -984,7 +1016,7 @@ export class AgentManager {
         record.session = session;
         // Every event the session emits (streamed text, tool output) is a sign
         // of life for the stall check.
-        this.followSession(watch, session);
+        this.followSession(id, watch, session);
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
         // in-memory session reports undefined, which correctly means
@@ -1371,59 +1403,66 @@ export class AgentManager {
     let cutLoose!: () => void;
     const dead = new Promise<{ cut: true }>(resolve => { cutLoose = () => resolve({ cut: true }); });
     const watch = this.watchRun(id, () => cutLoose());
-    this.followSession(watch, record.session);
-    const touch = () => { watch.lastActivityAt = Date.now(); };
+    this.followSession(id, watch, record.session);
+    const touch = () => this.touchRun(id);
 
-    try {
-      const outcome = await Promise.race([
-        resumeAgent(record.session, prompt, {
-          onToolActivity: (activity) => {
-            touch();
-            if (activity.type === "end") record.toolUses++;
-            options?.onToolActivity?.(activity);
-          },
-          onAssistantUsage: (usage) => {
-            touch();
-            addUsage(record.lifetimeUsage, usage);
-            this.onUsage?.(record, usage);
-            options?.onAssistantUsage?.(usage);
-          },
-          onCompaction: (info) => {
-            record.compactionCount++;
-            this.onCompact?.(record, info);
-            options?.onCompaction?.(info);
-          },
-          signal: abortController.signal,
-        }),
-        dead,
-      ]);
-      // Cut from outside (stalled, or a stop it ignored): the record already
-      // carries that outcome. Otherwise the same contract as the spawn path
-      // (#144): a failed final turn is an error, not a completion, but the
-      // resumed text stays available; and a stop keeps its "stopped".
-      if ("text" in outcome && this.claimRun(id, watch)) {
-        // Widened: abort() can have changed it while the turn ran.
-        if ((record.status as AgentRecord["status"]) !== "stopped") {
-          record.status = outcome.failure ? "error" : "completed";
-          if (outcome.failure) record.error = outcome.failure;
+    // The whole turn, published as `record.promise` before the first await:
+    // waitForAll() and anything else awaiting the record waits on THIS turn,
+    // not on the spawn's long-settled promise (which it would spin on).
+    const session = record.session;
+    const turn = (async () => {
+      try {
+        const outcome = await Promise.race([
+          resumeAgent(session, prompt, {
+            onToolActivity: (activity) => {
+              touch();
+              if (activity.type === "end") record.toolUses++;
+              options?.onToolActivity?.(activity);
+            },
+            onAssistantUsage: (usage) => {
+              touch();
+              addUsage(record.lifetimeUsage, usage);
+              this.onUsage?.(record, usage);
+              options?.onAssistantUsage?.(usage);
+            },
+            onCompaction: (info) => {
+              record.compactionCount++;
+              this.onCompact?.(record, info);
+              options?.onCompaction?.(info);
+            },
+            signal: abortController.signal,
+          }),
+          dead,
+        ]);
+        // Cut from outside (stalled, or a stop it ignored): the record already
+        // carries that outcome. Otherwise the same contract as the spawn path
+        // (#144): a failed final turn is an error, not a completion, but the
+        // resumed text stays available; and a stop keeps its "stopped".
+        if ("text" in outcome && this.claimRun(id, watch)) {
+          // Widened: abort() can have changed it while the turn ran.
+          if ((record.status as AgentRecord["status"]) !== "stopped") {
+            record.status = outcome.failure ? "error" : "completed";
+            if (outcome.failure) record.error = outcome.failure;
+          }
+          record.result = outcome.text;
+          record.completedAt ??= Date.now();
         }
-        record.result = outcome.text;
-        record.completedAt ??= Date.now();
+      } catch (err) {
+        if (this.claimRun(id, watch)) {
+          if ((record.status as AgentRecord["status"]) !== "stopped") record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt ??= Date.now();
+        }
+      } finally {
+        signal?.removeEventListener("abort", onCallerAbort);
       }
-    } catch (err) {
-      if (this.claimRun(id, watch)) {
-        if ((record.status as AgentRecord["status"]) !== "stopped") record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt ??= Date.now();
-      }
-    } finally {
-      signal?.removeEventListener("abort", onCallerAbort);
-    }
 
-    // Same contract as the spawn settle paths: children spawned during the
-    // resumed turn must not outlive it — nothing else can see or reach them.
-    this.abortOwnedChildren(id);
-
+      // Same contract as the spawn settle paths: children spawned during the
+      // resumed turn must not outlive it — nothing else can see or reach them.
+      this.abortOwnedChildren(id);
+    })();
+    record.promise = turn.then(() => record.result ?? "");
+    await turn;
     return record;
   }
 
@@ -1487,8 +1526,8 @@ export class AgentManager {
     let cutLoose!: () => void;
     const dead = new Promise<void>(resolve => { cutLoose = resolve; });
     const watch = this.watchRun(id, () => { settle(); cutLoose(); });
-    this.followSession(watch, record.session);
-    const touch = () => { watch.lastActivityAt = Date.now(); };
+    this.followSession(id, watch, record.session);
+    const touch = () => this.touchRun(id);
 
     const promise = resumeAgent(record.session, prompt, {
       onToolActivity: (activity) => {

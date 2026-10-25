@@ -346,6 +346,30 @@ describe("agent-runner final output capture", () => {
     expect(ctorArgs.appendSystemPromptOverride(["would-be-loaded"])).toEqual([]);
   });
 
+  // A stop that lands while the session is still being built (extension
+  // initialization) fires before the abort forwarder exists; it must still keep
+  // the agent from starting its turn (#283: a stalled agent is aborted, and must
+  // not come back to life once its slot and caller are gone).
+  it("does not start a turn whose stop landed while the session was being built", async () => {
+    const { session } = createSession("SHOULD NOT RUN");
+    createAgentSession.mockResolvedValue({ session });
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runAgent(ctx, "Explore", "work", { pi, signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(result.aborted).toBe(true);
+  });
+
+  it("resumeAgent does not start a turn that was already stopped", async () => {
+    const { session } = createSession("SHOULD NOT RUN");
+    const controller = new AbortController();
+    controller.abort();
+    await resumeAgent(session as any, "again", { signal: controller.signal });
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
   it("resumeAgent also falls back to the final assistant message text", async () => {
     const { session } = createSession("RESUMED");
 
