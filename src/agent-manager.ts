@@ -1013,6 +1013,12 @@ export class AgentManager {
         maxSubagentDepth: record.maxSubagentDepth,
       },
       onSessionCreated: (session) => {
+        // Arrived after the stall check settled the run, and after cleanup took
+        // the record: nobody will dispose it, so shut it down here.
+        if (watch.settled && this.agents.get(id) !== record) {
+          void shutdownChildSession(session);
+          return;
+        }
         record.session = session;
         // Every event the session emits (streamed text, tool output) is a sign
         // of life for the stall check.
@@ -1394,8 +1400,10 @@ export class AgentManager {
     // reaches this run rather than the finished one the agent was spawned with.
     const abortController = new AbortController();
     record.abortController = abortController;
-    const onCallerAbort = () => abortController.abort();
-    if (signal?.aborted) abortController.abort();
+    // Through abort(), so the record reads "stopped" (not a completion with
+    // partial or no output) whichever way the stop came in.
+    const onCallerAbort = () => { this.abort(id); };
+    if (signal?.aborted) this.abort(id);
     else signal?.addEventListener("abort", onCallerAbort, { once: true });
 
     // Raced against the stall check, like the spawn path: a resumed turn that

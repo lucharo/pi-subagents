@@ -1079,6 +1079,14 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             continue;
           }
 
+          // A skip was accepted while the child could not be reached (still
+          // starting up, or it finished before the stop landed): the caller was
+          // told it is skipped, so the script gets the null a skip promises.
+          if (intent() === "skip" && !result.skipped) {
+            const { text: _dropped, ...rest } = result;
+            result = { ...rest, ok: false, skipped: true, error: "Skipped by user." };
+          }
+
           // Counted before the response is sent, so the very call that spent
           // them already sees them in `budget.spent()`. Failed and skipped
           // agents count too — they burned the tokens either way.

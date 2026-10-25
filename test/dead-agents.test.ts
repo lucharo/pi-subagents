@@ -330,4 +330,69 @@ describe("a run that stops responding is settled as failed", () => {
     await expect(pending).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/^Stopped responding: its wind-down/) });
     expect(stalled).toEqual([]);
   });
+
+  it("marks a foreground resume stopped when its caller's signal aborts, already or mid-turn", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: liveSession(), aborted: false, steered: false } as any);
+    const id = manager.spawn(mockPi, ctx(), "general-purpose", "p", { description: "p", isBackground: true });
+    await manager.getRecord(id)!.promise;
+    vi.mocked(resumeAgent).mockImplementation((_s, _p, o: any) =>
+      o.signal.aborted ? Promise.resolve({ text: "" }) : new Promise(resolve => o.signal.addEventListener("abort", () => resolve({ text: "partial" }))));
+
+    await expect(manager.resume(id, "again", AbortSignal.abort())).resolves.toMatchObject({ status: "stopped" });
+
+    const caller = new AbortController();
+    const resumed = manager.resume(id, "again", caller.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    caller.abort();
+    await expect(resumed).resolves.toMatchObject({ status: "stopped", result: "partial" });
+  });
+
+  it("shuts down a session that arrives after its run was settled and its record cleaned up", async () => {
+    let opts: any;
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, o: any) => { opts = o; return new Promise(() => {}); });
+    const id = manager.spawn(mockPi, ctx(), "general-purpose", "slow start", { description: "s", isBackground: true });
+    await vi.advanceTimersByTimeAsync(DEFAULT_STALL_LIMIT_MS + MINUTE);
+    expect(manager.getRecord(id)?.status).toBe("error");
+    await vi.advanceTimersByTimeAsync(11 * MINUTE); // the ten-minute cleanup takes the record
+    expect(manager.getRecord(id)).toBeUndefined();
+
+    const emit = vi.fn(async () => {});
+    const late = { ...liveSession(), extensionRunner: { hasHandlers: () => true, emit } };
+    opts.onSessionCreated(late);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+    expect(late.dispose).toHaveBeenCalled();
+    expect(late.subscribe).not.toHaveBeenCalled();
+  });
+
+  it("applies a workflow's skip that arrived while its child was still starting", async () => {
+    let releaseWorktree!: () => void;
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockImplementationOnce(() => new Promise(resolve => {
+      releaseWorktree = () => resolve({ path: "/tmp/wt", branch: "b", baseSha: "s", workPath: "/tmp/wt" });
+    }));
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, o: any) =>
+      new Promise(resolve => o.signal.addEventListener("abort", () => resolve({ responseText: "", session: liveSession(), aborted: true, steered: false }))));
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf_start01" });
+    const pending = host.spawnAgent({ agentId: "wf-agent-0", index: 0, prompt: "p", label: "p", agentType: "general-purpose", isolation: "worktree" });
+    await vi.advanceTimersByTimeAsync(0);
+
+    host.abortAgent("wf-agent-0"); // no manager id yet
+    releaseWorktree();
+
+    await expect(pending).resolves.toMatchObject({ ok: false, skipped: true });
+  });
+
+  it("fails a gate whose command never exits, a minute past its timeout", async () => {
+    const pi = { exec: vi.fn(() => new Promise(() => {})) } as any;
+    const host = createWorkflowHost({ pi, ctx: ctx(), manager, gateTimeoutMs: 5 * MINUTE });
+    const gate = host.runGate!("npm test", { agentId: "wf-agent-0" });
+    let out: any;
+    void gate.then(r => { out = r; });
+    await vi.advanceTimersByTimeAsync(5 * MINUTE + 59_000);
+    expect(out).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(out).toEqual({ ok: false, output: "Gate command did not exit after its timeout: npm test" });
+  });
 });

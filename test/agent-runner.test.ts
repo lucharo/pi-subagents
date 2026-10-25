@@ -362,6 +362,23 @@ describe("agent-runner final output capture", () => {
     expect(result.aborted).toBe(true);
   });
 
+  it("aborts a run that starts after its stop landed during prompt's preflight", async () => {
+    const { session, listeners } = createSession("LATE");
+    createAgentSession.mockResolvedValue({ session });
+    const controller = new AbortController();
+    // The stop arrives while prompt() is still before the run (a slow before_agent_start handler)…
+    session.prompt.mockImplementation(async () => {
+      controller.abort();
+      session.abort.mockClear(); // the forwarder's abort found no run to stop
+      for (const l of listeners) l({ type: "agent_start" });
+    });
+
+    await runAgent(ctx, "Explore", "work", { pi, signal: controller.signal });
+
+    // …and the run that starts afterwards is aborted the moment it starts.
+    expect(session.abort).toHaveBeenCalled();
+  });
+
   it("resumeAgent does not start a turn that was already stopped", async () => {
     const { session } = createSession("SHOULD NOT RUN");
     const controller = new AbortController();

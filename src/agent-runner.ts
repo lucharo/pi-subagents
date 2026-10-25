@@ -597,7 +597,19 @@ function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => 
   if (!signal) return () => {};
   const onAbort = () => session.abort();
   signal.addEventListener("abort", onAbort, { once: true });
-  return () => signal.removeEventListener("abort", onAbort);
+  // A stop that lands while prompt() is still in its preflight (a slow
+  // before_agent_start handler) finds no run to abort; the run that starts
+  // afterwards is aborted the moment it starts.
+  let unsub: (() => void) | undefined;
+  try {
+    unsub = session.subscribe?.((event: AgentSessionEvent) => {
+      if ((event.type === "agent_start" || event.type === "turn_start") && signal.aborted) session.abort();
+    });
+  } catch { /* a stubbed session: the listener above still covers later stops */ }
+  return () => {
+    signal.removeEventListener("abort", onAbort);
+    unsub?.();
+  };
 }
 
 function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string): string | undefined {
