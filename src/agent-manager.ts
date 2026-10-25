@@ -1080,19 +1080,25 @@ export class AgentManager {
             record.status = steered ? "steered" : "completed";
           }
         }
-        record.result = responseText;
-        // Kept beside `result`, never inside it: `result` is prose meant for a
-        // reader — it is previewed, transcribed, and appended to below — while
-        // this is a machine-readable payload one caller asked for by schema.
-        record.structuredJson = structuredJson;
-        record.structuredRetried = structuredRetried;
-        record.session = session;
-        record.completedAt ??= Date.now();
+        // A run the stall check already settled ends here late: the record may
+        // be on a newer invocation by now (a resume), so nothing of this one's
+        // outcome, output stream or children is written over it.
+        const late = () => watch.settled;
+        if (!late()) {
+          record.result = responseText;
+          // Kept beside `result`, never inside it: `result` is prose meant for a
+          // reader — it is previewed, transcribed, and appended to below — while
+          // this is a machine-readable payload one caller asked for by schema.
+          record.structuredJson = structuredJson;
+          record.structuredRetried = structuredRetried;
+          record.session = session;
+          record.completedAt ??= Date.now();
+        }
 
         detach();
 
         // Final flush of streaming output file
-        if (record.outputCleanup) {
+        if (record.outputCleanup && !late()) {
           try { record.outputCleanup(); } catch { /* ignore */ }
           record.outputCleanup = undefined;
         }
@@ -1109,7 +1115,7 @@ export class AgentManager {
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
           record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
+          if (wtResult.hasChanges && wtResult.branch && !late()) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -1121,7 +1127,7 @@ export class AgentManager {
           }
         }
 
-        this.abortOwnedChildren(id);
+        if (!late()) this.abortOwnedChildren(id);
 
         if (this.claimRun(id, watch)) this.settleRun(record, true, pool);
         return responseText;
@@ -1139,7 +1145,7 @@ export class AgentManager {
         detach();
 
         // Final flush of streaming output file on error
-        if (record.outputCleanup) {
+        if (record.outputCleanup && !watch.settled) {
           try { record.outputCleanup(); } catch { /* ignore */ }
           record.outputCleanup = undefined;
         }
@@ -1152,7 +1158,7 @@ export class AgentManager {
           } catch { /* ignore cleanup errors */ }
         }
 
-        this.abortOwnedChildren(id);
+        if (!watch.settled) this.abortOwnedChildren(id);
 
         if (this.claimRun(id, watch)) this.settleRun(record, false, pool);
         return "";
@@ -1335,6 +1341,11 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    // The previous invocation has not wound down yet (a stop it ignored, still
+    // inside its grace): resuming now would replace its watch and leave it
+    // unwatched, its slot and awaiters never settled.
+    const prior = this.watches.get(id);
+    if (prior && !prior.settled) return undefined;
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1791,6 +1802,9 @@ export class AgentManager {
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       if (this.holds.has(id)) continue;
+      // Finished but still winding down (a gate, worktree cleanup): the stall
+      // check decides how that ends, not the ten-minute sweep.
+      if (this.watches.get(id)?.settled === false) continue;
       if (Math.max(record.completedAt ?? 0, this.releasedAt.get(id) ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -1811,6 +1825,7 @@ export class AgentManager {
       // cancelled, and the run carries on: clearing here would break its next
       // resume. Once released, the ten-minute cleanup takes it.
       if (this.holds.has(id)) continue;
+      if (this.watches.get(id)?.settled === false) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }

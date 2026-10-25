@@ -395,4 +395,58 @@ describe("a run that stops responding is settled as failed", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(out).toEqual({ ok: false, output: "Gate command did not exit after its timeout: npm test" });
   });
+
+  it("refuses a resume while the previous run is still winding down from a stop it ignored", async () => {
+    const session = liveSession();
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, o: any) => { o.onSessionCreated(session); return new Promise(() => {}); });
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "again" } as any);
+    const id = manager.spawn(mockPi, ctx(), "general-purpose", "deaf", { description: "deaf", isBackground: true });
+    await vi.advanceTimersByTimeAsync(0);
+    manager.abort(id);
+
+    await expect(manager.resume(id, "too soon")).resolves.toBeUndefined();
+    expect(resumeAgent).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(STOP_GRACE_MS + MINUTE);
+    await expect(manager.resume(id, "now")).resolves.toMatchObject({ status: "completed", result: "again" });
+  });
+
+  it("leaves a finished run that is still winding down to the stall check, not the ten-minute sweep", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: liveSession(), aborted: false, steered: false } as any);
+    vi.mocked(cleanupWorktree).mockImplementationOnce(() => new Promise(() => {}));
+    let settledWith: any;
+    void manager.spawnAndWait(mockPi, ctx(), "general-purpose", "p", { description: "p", isolation: "worktree" })
+      .then(r => { settledWith = r.record.status; });
+
+    await vi.advanceTimersByTimeAsync(30 * MINUTE);
+    expect(settledWith).toBeUndefined(); // not reported as a success mid-wind-down
+    expect(manager.listAgents()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(31 * MINUTE);
+    expect(settledWith).toBe("error");
+  });
+
+  it("a settled run that ends late does not write over the resume that followed it", async () => {
+    const session = liveSession();
+    const run = deferredRun();
+    vi.mocked(runAgent).mockImplementation((_c, _t, _p, o: any) => { o.onSessionCreated(session); return run.promise; });
+    const turn = deferredRun();
+    vi.mocked(resumeAgent).mockImplementation(() => turn.promise);
+    const id = manager.spawn(mockPi, ctx(), "general-purpose", "p", { description: "p", isBackground: true });
+    await vi.advanceTimersByTimeAsync(DEFAULT_STALL_LIMIT_MS + MINUTE);
+    expect(manager.getRecord(id)?.status).toBe("error");
+
+    const resumed = manager.resume(id, "again");
+    await vi.advanceTimersByTimeAsync(0);
+    const streamOfResume = vi.fn();
+    manager.getRecord(id)!.outputCleanup = streamOfResume;
+
+    run.resolve({ responseText: "late spawn text", session, aborted: false, steered: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.getRecord(id)?.result).not.toBe("late spawn text");
+    expect(streamOfResume).not.toHaveBeenCalled();
+
+    turn.resolve({ text: "second" });
+    await expect(resumed).resolves.toMatchObject({ status: "completed", result: "second" });
+  });
 });
