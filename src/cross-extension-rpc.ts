@@ -1,7 +1,7 @@
 /**
  * Cross-extension RPC handlers for the subagents extension.
  *
- * Exposes ping, spawn, stop, and consume RPCs over the pi.events event bus,
+ * Exposes ping, spawn, stop, workflow-stop and consume RPCs over the pi.events event bus,
  * using per-request scoped reply channels.
  *
  * Reply envelope follows pi-mono convention:
@@ -52,17 +52,29 @@ export interface SpawnCapable {
   consumeResult(id: string): boolean;
 }
 
+/** The session's workflow runs, as the workflow-stop RPC needs them. */
+export interface WorkflowStopCapable {
+  /**
+   * Stop run `runId`, or only its agent at `index`. Returns why nothing was
+   * stopped (unknown run, not running, agent already finished), or undefined.
+   */
+  stop(runId: string, index?: number): string | undefined;
+}
+
 export interface RpcDeps {
   events: EventBus;
   pi: unknown;                    // passed through to manager.spawn
   getCtx: () => unknown | undefined;  // returns current ExtensionContext
   manager: SpawnCapable;
+  /** Absent: the workflow-stop channel answers that workflows are not available. */
+  workflows?: WorkflowStopCapable;
 }
 
 export interface RpcHandle {
   unsubPing: () => void;
   unsubSpawn: () => void;
   unsubStop: () => void;
+  unsubWorkflowStop: () => void;
   unsubConsume: () => void;
 }
 
@@ -183,6 +195,23 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     },
   );
 
+  // A workflow's agents are refused by `stop` above: the run is waiting on
+  // them. This is the run's own stop, so the same request goes through the run
+  // instead: the whole run (aborted, settles as stopped), or one agent of it
+  // (skipped: its `agent()` call returns null and the run goes on), exactly as
+  // the workflows dialog's kill and skip keys do.
+  const unsubWorkflowStop = handleRpc<{ requestId: string; runId: string; index?: number }>(
+    events, "subagents:rpc:workflow-stop", ({ runId, index }) => {
+      if (!deps.workflows) throw new Error("Workflows are not available in this session");
+      if (typeof runId !== "string" || runId === "") throw new Error("runId is required");
+      if (index !== undefined && !(Number.isInteger(index) && index >= 0)) {
+        throw new Error("index must be a non-negative integer");
+      }
+      const refusal = deps.workflows.stop(runId, index);
+      if (refusal !== undefined) throw new Error(refusal);
+    },
+  );
+
   // A caller that has already shown the model an agent's result — pi-tasks'
   // TaskOutput is the one in practice — says so here, so the completion
   // notification for that same result is not delivered on top of it and does
@@ -194,5 +223,5 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     },
   );
 
-  return { unsubPing, unsubSpawn, unsubStop, unsubConsume };
+  return { unsubPing, unsubSpawn, unsubStop, unsubWorkflowStop, unsubConsume };
 }

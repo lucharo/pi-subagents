@@ -682,6 +682,8 @@ Two rewrites are suppressed outright rather than left to the mode, because they 
 
 Turn `all` on for tools that genuinely emit Markdown, and off again for a diff or a log. `m` in the viewer cycles the three and persists the choice, so the key and this setting are the same value — the footer shows which is in force as `m raw` / `m md` / `m md+`. Code fences are syntax-highlighted using pi's own Markdown theme — which is also why fenced code is the one part of a result *not* dimmed under `all`; result prose still is, so the transcript keeps its hierarchy. Applied live; also settable from `/agents → Settings → Viewer markdown`.
 
+**Stale agents** (`staleAgentMinutes`, default `60`): an agent that has written nothing for this many minutes (no streamed text, no tool event, no token usage) is marked `error` with "Stopped responding: nothing written for N min.", aborted, and settled: its concurrency slot is freed, it stops counting as running (so `hasRunning()` and anything waiting on it, a session restart included, let go), and its parent is told. A top-level agent's parent gets the usual completion notification; a workflow child's `agent()` call returns `null`, its row reads failed, and the parent session gets a notification naming the run and the agent; every stalled agent is also announced on the [`subagents:stalled`](#events) event. A workflow run with no agent in flight whose progress has not moved for as long (a script that spins or waits on nothing) is stopped and settles as `failed` with "Workflow stopped responding: …". A stopped agent whose run ignores the stop is settled anyway after 30 seconds. Checked once a minute. `0` turns the check off. Set it by hand in `subagents.json`; there is no menu row.
+
 **Workflows** (`workflowsEnabled`, default `true`): the master switch for scripted workflows. Toggle it via `/agents → Settings → Workflows`, or set it in `subagents.json`. Off, the `SubagentWorkflow` tool is never registered — the model is not told the feature exists and cannot call it, so it costs no tool-spec context — the `/agents → Workflows` entry is hidden, and `--subagents-workflow-file` refuses with a pointer to the setting rather than doing nothing. Read at extension load, so it applies on the next pi session; runs already in flight are left alone.
 
 Leaving it unset is not quite the same as `true`. Unset means *auto*: on, unless another extension already provides a workflow tool, in which case this one warns and stands down for the session. Two orchestrators in one tool spec is a worse default than none — the model has to guess which to call and pays for both descriptions to find out — and the extension that was installed on purpose is the one that should survive. Setting `workflowsEnabled` explicitly pins the answer: `true` keeps ours whatever else is loaded, `false` is off regardless.
@@ -734,10 +736,11 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
 | `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `{}` (empty object) |
+| `subagents:stalled` | An agent stopped responding and was marked failed ([`staleAgentMinutes`](#persistent-settings)) — fired for every agent, nested and workflow children included | `id`, `type`, `description`, `error`, `workflowId` (workflow child), `parentAgentId` (nested child) |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
 
-The four agent-lifecycle events — `subagents:started`, `:completed`, `:failed`, `:compacted` — are emitted for **top-level agents only**. Nested subagents and a workflow's children emit nothing at all; they report through the parent or workflow that owns them.
+The four agent-lifecycle events — `subagents:started`, `:completed`, `:failed`, `:compacted` — are emitted for **top-level agents only**. Nested subagents and a workflow's children emit nothing else; they report through the parent or workflow that owns them. `subagents:stalled` is the one exception, so whatever watches a run can tell one of its agents died.
 
 `tokens.total` = `input + output + cacheWrite`. `cacheRead` is excluded — each turn's `cacheRead` is the cumulative cached prefix re-read on that one API call, so summing per-message would over-count it as a measure of work done. Use `contextUsage.percent` (surfaced as `(NN%)` in the widget) for current context size.
 
@@ -816,6 +819,19 @@ const unsub = pi.events.on(`subagents:rpc:stop:reply:${requestId}`, (reply) => {
 });
 pi.events.emit("subagents:rpc:stop", { requestId, agentId: "agent-id-here" });
 ```
+
+### Workflow stop
+
+Stop a running (or paused) [workflow](#subagentworkflow) run, or one of its agents. `subagents:rpc:stop` refuses a workflow's agents because the run is waiting on them; this goes through the run instead, exactly as the `/agents → Workflows` kill and skip keys do:
+
+```typescript
+// The whole run: aborted, settles as stopped.
+pi.events.emit("subagents:rpc:workflow-stop", { requestId: crypto.randomUUID(), runId: "wf_1a2b3c4d5e6f" });
+// One agent, by its index in the run: skipped. Its agent() call returns null and the run goes on.
+pi.events.emit("subagents:rpc:workflow-stop", { requestId: crypto.randomUUID(), runId: "wf_1a2b3c4d5e6f", index: 6 });
+```
+
+Run ids and agent indexes are the `id` and `agents[].index` of the snapshots `listWorkflows()` and the `subagents:workflow` event carry. Errors: `Workflow not found`, `Workflow is not running`, `Agent is not running` (that agent already finished), `index must be a non-negative integer`.
 
 ### Consume
 

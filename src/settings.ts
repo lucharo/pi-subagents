@@ -226,6 +226,13 @@ export interface SubagentsSettings {
    */
   maxSubagentDepth?: number;
   /**
+   * Minutes a running agent or workflow may write nothing before it is marked
+   * failed ("Stopped responding"), settled, and its parent told. Default 60;
+   * `0` turns the check off. Applies to Agent-tool agents, nested ones and
+   * workflow children, and to a workflow run with no agent left running.
+   */
+  staleAgentMinutes?: number;
+  /**
    * Agent type substituted when a caller-supplied `subagent_type` doesn't
    * resolve to exactly one enabled agent (unknown, disabled, or ambiguous by
    * case). Omitted keeps the historical `general-purpose` fallback; a type name
@@ -327,6 +334,7 @@ export interface SettingsAppliers {
   setWorktreeIsolation: (b: boolean) => void;
   setWorkflowsEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
+  setStaleAgentMinutes: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
@@ -350,6 +358,8 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
+/** A week: past that, a silent agent is not "slow" in any sense the check is for. */
+const STALE_MINUTES_CEILING = 7 * 24 * 60;
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
@@ -392,6 +402,14 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.maxSubagentDepth as number) <= SUBAGENT_DEPTH_CEILING
   ) {
     out.maxSubagentDepth = r.maxSubagentDepth as number;
+  }
+  // Floor 0: the documented "off" value.
+  if (
+    Number.isInteger(r.staleAgentMinutes) &&
+    (r.staleAgentMinutes as number) >= 0 &&
+    (r.staleAgentMinutes as number) <= STALE_MINUTES_CEILING
+  ) {
+    out.staleAgentMinutes = r.staleAgentMinutes as number;
   }
   if (typeof r.defaultJoinMode === "string" && VALID_JOIN_MODES.has(r.defaultJoinMode)) {
     out.defaultJoinMode = r.defaultJoinMode as JoinMode;
@@ -518,6 +536,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
+  if (typeof s.staleAgentMinutes === "number") appliers.setStaleAgentMinutes(s.staleAgentMinutes);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
