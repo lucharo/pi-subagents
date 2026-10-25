@@ -1,6 +1,6 @@
 # Driving subagents from another extension
 
-Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Four request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
+Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Five request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:workflow-stop`, `subagents:rpc:consume`), twelve lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
 
 The thing worth understanding up front is that **the bus is in-process.** Every "RPC" call here is a synchronous `pi.events.emit` into the same event loop, and every reply comes back the same way. That single fact explains most of what follows: why `signal` and the `on*` callbacks work on a spawn payload at all, why a `consume` fired inside a `subagents:completed` handler lands *before* the notification decision has been made, and why none of this survives a real process boundary.
 
@@ -88,7 +88,12 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `Agent not found` | stop — `src/cross-extension-rpc.ts:170` |
 | `Agent is owned by another agent or workflow` | stop — `:178` |
 | `Agent is not running` | stop — `:182`. The record exists, so it has already settled |
-| `Agent not found or still running` | consume — `:193` |
+| `Agent not found or still running` | consume |
+| `Workflow not found` | workflow-stop — no run with that id in this session |
+| `Workflow is not running` | workflow-stop — the run has already settled |
+| `Agent is not running` | workflow-stop with an `index` — that agent's `agent()` call has already returned |
+| `index must be a non-negative integer` / `runId is required` | workflow-stop — checked before the run is touched |
+| `Workflows are not available in this session` | workflow-stop — no run registry was wired (only reachable outside the extension) |
 
 Three things the table cannot show:
 
@@ -171,6 +176,7 @@ This document has no test of its own, so it is worth knowing which claims are ac
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings, model resolution and scope enforcement |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
+| `test/dead-agents-wiring.test.ts` | Real extension factory | `workflow-stop` stopping a run and skipping one of its agents, and its refusals |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, `subagents:ready`'s `{}` payload, consume's handle resolution, and its missing `workflowId` check.
 
@@ -180,4 +186,4 @@ Not pinned anywhere, so treat them as descriptions rather than contracts: the `S
 
 Read it for the shape of the whole loop: waiting on `subagents:ready`, keeping an id-keyed map of outstanding spawns, resolving each from the `subagents:completed` / `subagents:failed` handler, and consuming the result in the same synchronous handler that reports it.
 
-If what you want is many coordinated agents rather than one, hand a script to [`SubagentWorkflow`](workflows.md) instead of fanning out over `subagents:rpc:spawn` — and note that a workflow's agents are not yours: they emit no lifecycle events, and `subagents:rpc:stop` refuses them.
+If what you want is many coordinated agents rather than one, hand a script to [`SubagentWorkflow`](workflows.md) instead of fanning out over `subagents:rpc:spawn` — and note that a workflow's agents are not yours: they emit no lifecycle events (except `subagents:stalled` when one stops responding), and `subagents:rpc:stop` refuses them. To stop a run, or one of its agents, use `subagents:rpc:workflow-stop` with the run's id and, for one agent, its index (see the [README](../README.md#workflow-stop)): the whole run is aborted, or that agent is skipped and its `agent()` returns `null`.

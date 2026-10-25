@@ -794,6 +794,22 @@ describe("run control", () => {
     expect(agentEntries(result.progress).at(-1)).toMatchObject({ state: "error", skipped: true });
   });
 
+  it("honours a skip whose child could not be reached: a success that arrives after it still returns null", async () => {
+    const stub = controllableHost();
+    // A child still in startup: the host has nothing to stop yet, so the abort does nothing.
+    stub.host.abortAgent = agentId => { stub.aborted().push(agentId); };
+    let control: WorkflowControl | undefined;
+    const done = run("return await agent('one');", { host: stub.host, onControl: c => { control = c; } });
+
+    await until(() => stub.started().length === 1, "the agent to start");
+    expect(control?.skip(0)).toBe(true);
+    stub.finish("wf-agent-0", "work nobody waits for");
+
+    const result = await done;
+    expect(result.value).toBeNull();
+    expect(agentEntries(result.progress).at(-1)).toMatchObject({ state: "error", skipped: true, error: "Skipped by user." });
+  });
+
   it("skips an agent held at a pause without waiting for the resume", async () => {
     const stub = controllableHost();
     let control: WorkflowControl | undefined;

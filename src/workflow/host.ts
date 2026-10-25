@@ -187,6 +187,8 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
   const { pi, ctx, manager } = deps;
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
+  /** Aborts asked for before the child had a manager id (a skip during startup): applied when it gets one. */
+  const pendingAborts = new Set<string>();
   /** Who holds this run's records on the manager — see `release()`. */
   const holdOwner = `${deps.workflowId ?? "workflow"}#${++hostSequence}`;
   /**
@@ -209,11 +211,21 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
    * decided from one behaviour, whichever route the command took.
    */
   async function executeGate(command: string, cwd: string): Promise<WorkflowGateResult> {
-    const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
-      cwd,
-      timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
-      ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
-    });
+    const timeout = deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+    // pi.exec's own timeout sends SIGTERM; a command that ignores it never lets
+    // exec resolve, and the run would wait on the gate for good. A minute past
+    // the timeout it counts as failed.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const hung = new Promise<"hung">(resolve => { timer = setTimeout(() => resolve("hung"), timeout + 60_000); });
+    const result = await Promise.race([
+      pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
+        cwd,
+        timeout,
+        ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+      }),
+      hung,
+    ]).finally(() => clearTimeout(timer));
+    if (result === "hung") return { ok: false, output: `Gate command did not exit after its timeout: ${command}` };
     const output = [result.stdout, result.stderr]
       .map(stream => stream.trim())
       .filter(Boolean)
@@ -376,6 +388,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
           id => {
             spawnedId = id;
             records.set(request.agentId, id);
+            if (pendingAborts.delete(request.agentId)) manager.abort(id);
             // Held from the moment it exists, so `resume` can still reach it
             // however long the script takes to come back to it.
             if (!released) manager.hold(id, holdOwner);
@@ -399,9 +412,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
 
     abortAgent(agentId) {
       const id = records.get(agentId);
-      // Nothing to abort before the manager has issued an id — the child is
-      // still in startup, and the run's own signal reaches it there.
+      // Before the manager has issued an id the child is still in startup: the
+      // run's own signal reaches it there, but a skip of this one child must
+      // too, so it is remembered and applied when the id arrives.
       if (id !== undefined) manager.abort(id);
+      else pendingAborts.add(agentId);
     },
 
     async resumeAgent(agentId, prompt, onResolved) {

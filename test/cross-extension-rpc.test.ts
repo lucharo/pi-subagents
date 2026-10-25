@@ -292,6 +292,60 @@ describe("cross-extension RPC", () => {
 
   // --- consume ---
 
+  describe("workflow-stop RPC", () => {
+    /** Send one request and return its reply envelope. */
+    async function ask(params: Record<string, unknown>, id = `req-ws-${Math.random()}`) {
+      const reply = vi.fn();
+      events.on(`subagents:rpc:workflow-stop:reply:${id}`, reply);
+      events.emit("subagents:rpc:workflow-stop", { requestId: id, ...params });
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      return reply.mock.calls[0][0];
+    }
+
+    it("stops the whole run when no index is given", async () => {
+      const stop = vi.fn(() => undefined);
+      registerRpcHandlers({ ...deps, workflows: { stop } });
+      expect(await ask({ runId: "wf_abc123" })).toEqual({ success: true });
+      expect(stop).toHaveBeenCalledWith("wf_abc123", undefined);
+    });
+
+    it("stops one agent of the run when an index is given", async () => {
+      const stop = vi.fn(() => undefined);
+      registerRpcHandlers({ ...deps, workflows: { stop } });
+      expect(await ask({ runId: "wf_abc123", index: 6 })).toEqual({ success: true });
+      expect(stop).toHaveBeenCalledWith("wf_abc123", 6);
+    });
+
+    it("passes the run's refusal back as the error", async () => {
+      registerRpcHandlers({ ...deps, workflows: { stop: () => "Workflow is not running" } });
+      expect(await ask({ runId: "wf_abc123" })).toEqual({ success: false, error: "Workflow is not running" });
+    });
+
+    it("refuses a bad index or a missing run id before touching the run", async () => {
+      const stop = vi.fn(() => undefined);
+      registerRpcHandlers({ ...deps, workflows: { stop } });
+      expect(await ask({ runId: "wf_abc123", index: 1.5 })).toEqual({ success: false, error: "index must be a non-negative integer" });
+      expect(await ask({ runId: "wf_abc123", index: -1 })).toEqual({ success: false, error: "index must be a non-negative integer" });
+      expect(await ask({ index: 0 })).toEqual({ success: false, error: "runId is required" });
+      expect(stop).not.toHaveBeenCalled();
+    });
+
+    it("answers that workflows are unavailable when the session has none", async () => {
+      registerRpcHandlers(deps);
+      expect(await ask({ runId: "wf_abc123" })).toEqual({ success: false, error: "Workflows are not available in this session" });
+    });
+
+    it("unsub stops answering", async () => {
+      const { unsubWorkflowStop } = registerRpcHandlers({ ...deps, workflows: { stop: () => undefined } });
+      unsubWorkflowStop();
+      const reply = vi.fn();
+      events.on("subagents:rpc:workflow-stop:reply:req-gone", reply);
+      events.emit("subagents:rpc:workflow-stop", { requestId: "req-gone", runId: "wf_abc123" });
+      await new Promise(r => setTimeout(r, 20));
+      expect(reply).not.toHaveBeenCalled();
+    });
+  });
+
   describe("consume RPC", () => {
     it("returns success when the result is consumed", async () => {
       registerRpcHandlers(deps);

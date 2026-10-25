@@ -18,7 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, stalledMessage } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -71,7 +71,7 @@ import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { type WorkflowChildInfo, type WorkflowToolCall, workflowSnapshot } from "./workflow/snapshot.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatSettledEarly, formatWorkflowNotification, resolveResumeTarget, startsLiveAgent, updateWorkflowProgressBatch, type WorkflowTask, workflowHandoff, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatSettledEarly, formatWorkflowNotification, resolveResumeTarget, startsLiveAgent, stopWorkflowTask, updateWorkflowProgressBatch, type WorkflowTask, workflowHandoff, workflowResultText, workflowRunId, workflowStalled } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -824,6 +824,12 @@ export default function (pi: ExtensionAPI) {
             return true;
           },
         },
+        workflows: {
+          stop: (runId, index) => {
+            const task = workflowTasks.get(runId);
+            return task === undefined ? "Workflow not found" : stopWorkflowTask(task, index);
+          },
+        },
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -1101,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
+    rpcHandle?.unsubWorkflowStop();
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
     rpcHandle = undefined;
@@ -1113,6 +1120,7 @@ export default function (pi: ExtensionAPI) {
     scheduler.stop();
     // Before abortAll, and not folded into it: a workflow owns a worker thread
     // as well as its children, and only its own signal terminates that.
+    clearInterval(workflowStallTimer);
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     for (const info of workflowChildren.values()) info.off?.();
@@ -1429,6 +1437,7 @@ export default function (pi: ExtensionAPI) {
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
+      setStaleAgentMinutes: (n) => manager.setStallLimitMs(n * 60_000),
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
       setShowCost,
@@ -2318,6 +2327,66 @@ Terse command-style prompts produce shallow, generic work.
    * background run.
    */
   const workflowTasks = new Map<string, WorkflowTask>();
+
+  // ---- Fork addition (lucharo/pi-subagents): dead agents and runs ----
+  //
+  // The manager marks an agent that has written nothing for the stall limit as
+  // failed ("Stopped responding") and settles it, so a workflow's `agent()`
+  // returns null and the row reads failed. A top-level agent's own completion
+  // notification already tells the parent; a workflow child has none, so its
+  // parent session is told here. Every stalled agent is also announced on
+  // `subagents:stalled` for other extensions.
+  manager.setOnStalled(record => {
+    try {
+      pi.events.emit("subagents:stalled", {
+        id: record.id,
+        type: record.type,
+        description: record.description,
+        error: record.error,
+        ...(record.workflowId !== undefined ? { workflowId: record.workflowId } : {}),
+        ...(record.parentAgentId !== undefined ? { parentAgentId: record.parentAgentId } : {}),
+      });
+    } catch { /* listeners never break the sweep */ }
+    if (record.workflowId === undefined) return;
+    const task = workflowTasks.get(record.workflowId);
+    if (task === undefined || (task.status !== "running" && task.status !== "paused")) return;
+    const name = task.workflowName ?? task.id;
+    const error = record.error ?? stalledMessage(manager.getStallLimitMs());
+    // The notification channel a finished agent uses, so it renders the same.
+    pi.sendMessage<NotificationDetails>({
+      customType: "subagent-notification",
+      content:
+        `Workflow "${name}" (${task.id}): agent "${record.description}" ${error.replace(/^Stopped/, "stopped")} ` +
+        "It is marked failed and the run goes on without it. Stop the run from /agents → Workflows if it cannot do without that agent.",
+      display: true,
+      details: {
+        id: record.id,
+        description: `${record.description} · workflow ${name}`,
+        status: "error",
+        toolUses: record.toolUses,
+        turnCount: 0,
+        totalTokens: getLifetimeTotal(record.lifetimeUsage),
+        durationMs: Math.max(0, (record.completedAt ?? Date.now()) - record.startedAt),
+        error,
+        resultPreview: error,
+      },
+    }, { deliverAs: "followUp", triggerTurn: true });
+  });
+
+  // A run with no agent in flight whose log has not moved for the stall limit
+  // is spinning or waiting on nothing (see `workflowStalled`): stop it as a
+  // failure, which settles it, notifies the parent as any finished run does,
+  // and takes it off the list of running work.
+  const workflowStallTimer = setInterval(() => {
+    const limit = manager.getStallLimitMs();
+    const now = Date.now();
+    for (const task of workflowTasks.values()) {
+      if (!workflowStalled(task, now, limit)) continue;
+      task.stalled = `Workflow ${stalledMessage(limit).replace(/^Stopped/, "stopped")}`;
+      task.abortController.abort();
+    }
+  }, 60_000);
+  workflowStallTimer.unref?.();
 
   // ---- Fork addition (lucharo/pi-subagents): workflow snapshots for other extensions ----
   //
@@ -3699,6 +3768,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // `fallbackSubagent` below.
       workflowsEnabled: isWorkflowsPinned() ? isWorkflowsEnabled() : undefined,
       maxSubagentDepth: getMaxSubagentDepth(),
+      // Hand-edited only (no menu row): written back as read, so a menu change
+      // elsewhere keeps it.
+      staleAgentMinutes: Math.round(manager.getStallLimitMs() / 60_000),
       // Deliberately NOT `?? "general-purpose"`: every settings change writes the
       // whole snapshot, and materializing the implicit default would turn it into
       // explicit configuration — which then fails loudly if general-purpose later
