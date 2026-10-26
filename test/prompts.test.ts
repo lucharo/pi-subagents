@@ -1,7 +1,7 @@
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt, hasSkillsCatalog } from "../src/prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideSkillsFromCatalog } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -513,5 +513,25 @@ describe("hasSkillsCatalog", () => {
     expect(hasSkillsCatalog("<project_context>\n<skills>\n- use tdd\n</skills>\n</project_context>")).toBe(false);
     expect(hasSkillsCatalog("")).toBe(false);
     expect(hasSkillsCatalog(undefined)).toBe(false);
+  });
+});
+
+describe("hideSkillsFromCatalog", () => {
+  it("keeps every skill loaded but leaves pi nothing to render in a catalog", () => {
+    const skills = ["one", "two"].map((name) => ({
+      name,
+      description: `Use for ${name}.`,
+      filePath: `/skills/${name}/SKILL.md`,
+      baseDir: `/skills/${name}`,
+      sourceInfo: {} as never,
+      disableModelInvocation: false,
+    }));
+    const out = hideSkillsFromCatalog({ skills, diagnostics: [] });
+    expect(out.skills.map((s) => [s.name, s.filePath, s.disableModelInvocation])).toEqual([
+      ["one", "/skills/one/SKILL.md", true],
+      ["two", "/skills/two/SKILL.md", true],
+    ]);
+    expect(formatSkillsForPrompt(out.skills)).toBe("");
+    expect(skills[0].disableModelInvocation).toBe(false); // the loader's own list is not mutated
   });
 });

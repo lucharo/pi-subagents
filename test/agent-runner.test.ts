@@ -139,6 +139,7 @@ import {
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import { hideSkillsFromCatalog } from "../src/prompts.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -277,7 +278,7 @@ describe("agent-runner final output capture", () => {
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("worktreeBase");
   });
 
-  it("loads no second skills catalog when an append-mode child inherits the parent's", async () => {
+  it("renders no second skills catalog when an append-mode child inherits the parent's", async () => {
     const { buildAgentPrompt } = await import("../src/prompts.js");
     const catalog = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>";
     const parent = `preamble${catalog}\nCurrent working directory: /tmp`;
@@ -287,21 +288,23 @@ describe("agent-runner final output capture", () => {
     const append = () => vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
     const skillsOn = () => vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true, promptMode: "append" }));
 
-    // append + skills: true + a parent catalog → the child keeps the parent's prompt as it is and loads none of its own
+    // append + skills: true + a parent catalog → the parent's prompt stays as it is; skills still load, hidden from the catalog
     append(); skillsOn();
     await runAgent(parentCtx, "general-purpose", "Do it", { pi });
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: true }));
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(
+      expect.objectContaining({ noSkills: false, skillsOverride: hideSkillsFromCatalog }),
+    );
 
     // no catalog in the parent prompt → the child's loader supplies one
     append(); skillsOn();
     await runAgent({ ...ctx, getSystemPrompt: vi.fn(() => "preamble") }, "general-purpose", "Do it", { pi });
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false }));
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
 
     // replace mode never inlines the parent prompt → the child's loader supplies one
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "replace" })); skillsOn();
     await runAgent(parentCtx, "general-purpose", "Do it", { pi });
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false }));
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {

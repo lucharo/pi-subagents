@@ -24,7 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, hasSkillsCatalog, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideSkillsFromCatalog, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -661,12 +661,12 @@ export async function runAgent(
 
   // When skills is string[], we've already preloaded them into the prompt.
   // Still pass noSkills: true since we don't need the skill loader to load them again.
+  const noSkills = skills === false || Array.isArray(skills);
   // An append-mode child with skills: true inherits the parent prompt verbatim, catalog included
-  // (with any skill the parent got from --skill, which the child's loader would not find). Letting
-  // the loader append its own catalog too would list every skill twice, so it loads none.
+  // (with any skill the parent got from --skill, which the child's loader would not find). Its own
+  // loader still loads skills, so /skill:name expands, but renders no second catalog.
   const appendMode = (agentConfig?.promptMode ?? "append") === "append";
   const inheritsCatalog = skills === true && appendMode && hasSkillsCatalog(parentSystemPrompt);
-  const noSkills = skills === false || Array.isArray(skills) || inheritsCatalog;
 
   let toolNames = getToolNamesForType(type);
 
@@ -768,6 +768,7 @@ export async function runAgent(
     additionalExtensionPaths,
     extensionsOverride,
     noSkills,
+    skillsOverride: inheritsCatalog ? hideSkillsFromCatalog : undefined,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,

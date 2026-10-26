@@ -45,6 +45,19 @@ export function hasSkillsCatalog(prompt: string | undefined): boolean {
 }
 
 /**
+ * A `skillsOverride` for the child's resource loader that keeps every skill loaded but marks it
+ * `disableModelInvocation`, so pi renders no catalog for it. Used when the child already inherits the
+ * parent's catalog: `/skill:name` still expands (the registry is intact), and skills that extensions add
+ * while binding go through the same override, so they do not bring a second catalog either.
+ */
+export function hideSkillsFromCatalog<S extends { disableModelInvocation: boolean }, D>(base: { skills: S[]; diagnostics: D[] }): {
+  skills: S[];
+  diagnostics: D[];
+} {
+  return { ...base, skills: base.skills.map((skill) => ({ ...skill, disableModelInvocation: true })) };
+}
+
+/**
  * Build the system prompt for an agent from its config.
  *
  * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)
