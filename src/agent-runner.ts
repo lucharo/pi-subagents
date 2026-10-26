@@ -24,7 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, type PromptExtras, withoutSkillsSection } from "./prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -637,7 +637,7 @@ export async function runAgent(
   const env = await detectEnv(options.pi, effectiveCwd);
 
   // Get parent system prompt for append-mode agents
-  let parentSystemPrompt = ctx.getSystemPrompt();
+  const parentSystemPrompt = ctx.getSystemPrompt();
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
@@ -661,11 +661,12 @@ export async function runAgent(
 
   // When skills is string[], we've already preloaded them into the prompt.
   // Still pass noSkills: true since we don't need the skill loader to load them again.
-  const noSkills = skills === false || Array.isArray(skills);
-
-  // A child that loads skills gets pi's own <skills> section appended after the
-  // override; drop the copy inherited with the parent prompt so the list appears once.
-  if (!noSkills && parentSystemPrompt) parentSystemPrompt = withoutSkillsSection(parentSystemPrompt);
+  // An append-mode child with skills: true inherits the parent prompt verbatim, catalog included
+  // (with any skill the parent got from --skill, which the child's loader would not find). Letting
+  // the loader append its own catalog too would list every skill twice, so it loads none.
+  const appendMode = (agentConfig?.promptMode ?? "append") === "append";
+  const inheritsCatalog = skills === true && appendMode && hasSkillsCatalog(parentSystemPrompt);
+  const noSkills = skills === false || Array.isArray(skills) || inheritsCatalog;
 
   let toolNames = getToolNamesForType(type);
 

@@ -1,7 +1,7 @@
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt, withoutSkillsSection } from "../src/prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -489,31 +489,29 @@ describe("buildAgentPrompt", () => {
   });
 });
 
-describe("withoutSkillsSection", () => {
-  it("removes only pi's <skills> section, with the blank line before it", () => {
-    const prompt = "pre\n\n<rules>\nx\n</rules>\n\n<skills>\nlist\n<available_skills>\n  <skill>\n    <name>a &lt;b&gt;</name>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>\n/w\n</cwd>";
-    expect(withoutSkillsSection(prompt)).toBe("pre\n\n<rules>\nx\n</rules>\n\n<cwd>\n/w\n</cwd>");
+describe("hasSkillsCatalog", () => {
+  const skill = (name: string) => ({
+    name,
+    description: `Use for ${name} <work>.`,
+    filePath: `/skills/${name}/SKILL.md`,
+    baseDir: `/skills/${name}`,
+    sourceInfo: {} as never,
+    disableModelInvocation: false,
   });
 
-  it("removes the bare catalog the pinned pi's formatSkillsForPrompt appends", () => {
-    const skill = (name: string) => ({
-      name,
-      description: `Use for ${name} <work>.`,
-      filePath: `/skills/${name}/SKILL.md`,
-      baseDir: `/skills/${name}`,
-      sourceInfo: {} as never,
-      disableModelInvocation: false,
-    });
+  it("finds the bare catalog the pinned pi's formatSkillsForPrompt appends", () => {
     const catalog = formatSkillsForPrompt([skill("one"), skill("two")]);
-    expect(catalog).toContain("<available_skills>");
-    const parent = `You are pi.\n\nGuidelines:\n- be concise${catalog}\nCurrent working directory: /w`;
-    const stripped = withoutSkillsSection(parent);
-    expect(stripped).toBe("You are pi.\n\nGuidelines:\n- be concise\nCurrent working directory: /w");
-    // A child that loads skills gets the formatter's catalog appended once more: one copy in total.
-    expect((stripped + catalog).split("<available_skills>").length - 1).toBe(1);
+    expect(hasSkillsCatalog(`You are pi.${catalog}\nCurrent working directory: /w`)).toBe(true);
   });
 
-  it("leaves a prompt without a skills section unchanged", () => {
-    expect(withoutSkillsSection("pre\n\n<cwd>\n/w\n</cwd>")).toBe("pre\n\n<cwd>\n/w\n</cwd>");
+  it("finds pi 1.x's <skills> section, which wraps the same formatter output", () => {
+    const catalog = formatSkillsForPrompt([skill("one")]).trim();
+    expect(hasSkillsCatalog(`pre\n\n<rules>\nx\n</rules>\n\n<skills>\n${catalog}\n</skills>\n\n<cwd>\n/w\n</cwd>`)).toBe(true);
+  });
+
+  it("ignores a <skills> block written in project instructions, and an empty prompt", () => {
+    expect(hasSkillsCatalog("<project_context>\n<skills>\n- use tdd\n</skills>\n</project_context>")).toBe(false);
+    expect(hasSkillsCatalog("")).toBe(false);
+    expect(hasSkillsCatalog(undefined)).toBe(false);
   });
 });

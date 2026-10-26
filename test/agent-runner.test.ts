@@ -277,24 +277,31 @@ describe("agent-runner final output capture", () => {
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("worktreeBase");
   });
 
-  it("drops the inherited <skills> section when the child loads skills itself, and keeps it otherwise", async () => {
+  it("loads no second skills catalog when an append-mode child inherits the parent's", async () => {
     const { buildAgentPrompt } = await import("../src/prompts.js");
-    const parent = "preamble\n\n<rules>\n- r\n</rules>\n\n<skills>\nThe following skills...\n<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>\n/tmp\n</cwd>";
+    const catalog = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>";
+    const parent = `preamble${catalog}\nCurrent working directory: /tmp`;
     const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
     const { session } = createSession("ONCE");
     createAgentSession.mockResolvedValue({ session });
+    const append = () => vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
+    const skillsOn = () => vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true, promptMode: "append" }));
 
-    // skills: true → pi appends its own <skills> section, so the inherited copy goes.
-    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true }));
+    // append + skills: true + a parent catalog → the child keeps the parent's prompt as it is and loads none of its own
+    append(); skillsOn();
     await runAgent(parentCtx, "general-purpose", "Do it", { pi });
-    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe("preamble\n\n<rules>\n- r\n</rules>\n\n<cwd>\n/tmp\n</cwd>");
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false }));
-
-    // isolated → noSkills, pi appends nothing, so the inherited list is left as it was.
-    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true }));
-    await runAgent(parentCtx, "general-purpose", "Do it", { pi, isolated: true });
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
     expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: true }));
+
+    // no catalog in the parent prompt → the child's loader supplies one
+    append(); skillsOn();
+    await runAgent({ ...ctx, getSystemPrompt: vi.fn(() => "preamble") }, "general-purpose", "Do it", { pi });
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false }));
+
+    // replace mode never inlines the parent prompt → the child's loader supplies one
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "replace" })); skillsOn();
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi });
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false }));
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {

@@ -35,24 +35,13 @@ export interface PromptExtras {
   workflowChild?: boolean;
 }
 
-/** Pi 1.x renders the skills catalog as its own `<skills>` section. */
-const SKILLS_SECTION = /\n*<skills>\n[\s\S]*?\n<\/skills>/;
-/** Older pi (0.84) appends `formatSkillsForPrompt()` output bare: its preamble, then `<available_skills>`. */
-const SKILLS_CATALOG = /\n*The following skills provide specialized instructions for specific tasks\.[\s\S]*?<\/available_skills>/;
-
 /**
- * The parent's prompt with its skills catalog removed.
- *
- * In append mode the parent prompt is inlined verbatim, and it already carries pi's
- * skills catalog (the whole `<available_skills>` list). When the child also loads
- * skills itself, pi appends its own catalog after the override, so without this the
- * list appears twice: about 40k tokens per spawn with a few hundred skills. The
- * child's own catalog is the one to keep, since it reflects the child's skill config.
- * Handles both the sectioned (pi 1.x) and the bare (pi 0.84) rendering.
+ * Whether a prompt carries pi's own skills catalog: the formatter's fixed preamble line followed by
+ * `<available_skills>`. Both renderings have it (pi 1.x inside a `<skills>` section, pi 0.84 bare), and a
+ * `<skills>` block someone writes in AGENTS.md does not.
  */
-export function withoutSkillsSection(parentSystemPrompt: string): string {
-  if (SKILLS_SECTION.test(parentSystemPrompt)) return parentSystemPrompt.replace(SKILLS_SECTION, "");
-  return parentSystemPrompt.replace(SKILLS_CATALOG, "");
+export function hasSkillsCatalog(prompt: string | undefined): boolean {
+  return !!prompt && /The following skills provide specialized instructions for specific tasks\.[\s\S]*?<available_skills>/.test(prompt);
 }
 
 /**
