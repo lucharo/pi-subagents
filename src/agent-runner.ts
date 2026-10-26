@@ -24,7 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, hasSkillsCatalog, hideSkillsFromCatalog, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -664,7 +664,7 @@ export async function runAgent(
   const noSkills = skills === false || Array.isArray(skills);
   // An append-mode child with skills: true inherits the parent prompt verbatim, catalog included
   // (with any skill the parent got from --skill, which the child's loader would not find). Its own
-  // loader still loads skills, so /skill:name expands, but renders no second catalog.
+  // loader still loads skills, so /skill:name expands, but renders only the ones the parent's lacks.
   const appendMode = (agentConfig?.promptMode ?? "append") === "append";
   const inheritsCatalog = skills === true && appendMode && hasSkillsCatalog(parentSystemPrompt);
 
@@ -768,7 +768,7 @@ export async function runAgent(
     additionalExtensionPaths,
     extensionsOverride,
     noSkills,
-    skillsOverride: inheritsCatalog ? hideSkillsFromCatalog : undefined,
+    skillsOverride: inheritsCatalog ? hideSkillsListedIn(parentSystemPrompt) : undefined,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,

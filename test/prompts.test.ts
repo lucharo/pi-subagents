@@ -1,7 +1,7 @@
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt, hasSkillsCatalog, hideSkillsFromCatalog } from "../src/prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -516,22 +516,29 @@ describe("hasSkillsCatalog", () => {
   });
 });
 
-describe("hideSkillsFromCatalog", () => {
-  it("keeps every skill loaded but leaves pi nothing to render in a catalog", () => {
-    const skills = ["one", "two"].map((name) => ({
-      name,
-      description: `Use for ${name}.`,
-      filePath: `/skills/${name}/SKILL.md`,
-      baseDir: `/skills/${name}`,
-      sourceInfo: {} as never,
-      disableModelInvocation: false,
-    }));
-    const out = hideSkillsFromCatalog({ skills, diagnostics: [] });
-    expect(out.skills.map((s) => [s.name, s.filePath, s.disableModelInvocation])).toEqual([
-      ["one", "/skills/one/SKILL.md", true],
-      ["two", "/skills/two/SKILL.md", true],
+describe("hideSkillsListedIn", () => {
+  const skill = (name: string, filePath = `/skills/${name}/SKILL.md`) => ({
+    name,
+    description: `Use for ${name}.`,
+    filePath,
+    baseDir: filePath.replace(/\/SKILL\.md$/, ""),
+    sourceInfo: {} as never,
+    disableModelInvocation: false,
+  });
+
+  it("hides the skills the inherited catalog lists and keeps the child's own visible", () => {
+    const parent = `You are pi.${formatSkillsForPrompt([skill("one"), skill("a&b", "/skills/a&b/SKILL.md")])}`;
+    const childSkills = [skill("one"), skill("a&b", "/skills/a&b/SKILL.md"), skill("from-ext", "/ext/from-ext/SKILL.md")];
+    const out = hideSkillsListedIn(parent)({ skills: childSkills, diagnostics: [] });
+    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([
+      ["one", true],
+      ["a&b", true],
+      ["from-ext", false],
     ]);
-    expect(formatSkillsForPrompt(out.skills)).toBe("");
-    expect(skills[0].disableModelInvocation).toBe(false); // the loader's own list is not mutated
+    // pi renders only the child-only skill, so no entry appears twice
+    const rendered = formatSkillsForPrompt(out.skills);
+    expect(rendered).toContain("<name>from-ext</name>");
+    expect(rendered).not.toContain("<name>one</name>");
+    expect(childSkills[0].disableModelInvocation).toBe(false); // the loader's own list is not mutated
   });
 });

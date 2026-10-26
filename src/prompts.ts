@@ -44,17 +44,23 @@ export function hasSkillsCatalog(prompt: string | undefined): boolean {
   return !!prompt && /The following skills provide specialized instructions for specific tasks\.[\s\S]*?<available_skills>/.test(prompt);
 }
 
+const unescapeXml = (text: string) =>
+  text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+
 /**
- * A `skillsOverride` for the child's resource loader that keeps every skill loaded but marks it
- * `disableModelInvocation`, so pi renders no catalog for it. Used when the child already inherits the
- * parent's catalog: `/skill:name` still expands (the registry is intact), and skills that extensions add
- * while binding go through the same override, so they do not bring a second catalog either.
+ * A `skillsOverride` for the child's resource loader that keeps every skill loaded but marks the ones the
+ * inherited catalog already lists (by `<location>`) `disableModelInvocation`, so pi renders only the child's
+ * own additions. `/skill:name` still expands (the registry is intact), and skills that extensions add while
+ * binding go through the same override: one the parent already lists is hidden, one only the child has stays.
  */
-export function hideSkillsFromCatalog<S extends { disableModelInvocation: boolean }, D>(base: { skills: S[]; diagnostics: D[] }): {
-  skills: S[];
-  diagnostics: D[];
-} {
-  return { ...base, skills: base.skills.map((skill) => ({ ...skill, disableModelInvocation: true })) };
+export function hideSkillsListedIn(parentSystemPrompt: string) {
+  const listed = new Set(
+    [...parentSystemPrompt.matchAll(/<location>([^<]*)<\/location>/g)].map((m) => unescapeXml(m[1])),
+  );
+  return <S extends { filePath: string; disableModelInvocation: boolean }, D>(base: { skills: S[]; diagnostics: D[] }) => ({
+    ...base,
+    skills: base.skills.map((skill) => (listed.has(skill.filePath) ? { ...skill, disableModelInvocation: true } : skill)),
+  });
 }
 
 /**

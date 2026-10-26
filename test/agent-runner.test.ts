@@ -139,7 +139,6 @@ import {
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
-import { hideSkillsFromCatalog } from "../src/prompts.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -280,7 +279,7 @@ describe("agent-runner final output capture", () => {
 
   it("renders no second skills catalog when an append-mode child inherits the parent's", async () => {
     const { buildAgentPrompt } = await import("../src/prompts.js");
-    const catalog = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>";
+    const catalog = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n    <location>/skills/a/SKILL.md</location>\n  </skill>\n</available_skills>";
     const parent = `preamble${catalog}\nCurrent working directory: /tmp`;
     const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
     const { session } = createSession("ONCE");
@@ -292,9 +291,19 @@ describe("agent-runner final output capture", () => {
     append(); skillsOn();
     await runAgent(parentCtx, "general-purpose", "Do it", { pi });
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(
-      expect.objectContaining({ noSkills: false, skillsOverride: hideSkillsFromCatalog }),
-    );
+    const opts = defaultResourceLoaderCtor.mock.lastCall![0];
+    expect(opts.noSkills).toBe(false);
+    const hidden = opts.skillsOverride({
+      skills: [
+        { name: "a", filePath: "/skills/a/SKILL.md", disableModelInvocation: false },
+        { name: "b", filePath: "/skills/b/SKILL.md", disableModelInvocation: false },
+      ],
+      diagnostics: [],
+    });
+    expect(hidden.skills.map((s: { name: string; disableModelInvocation: boolean }) => [s.name, s.disableModelInvocation])).toEqual([
+      ["a", true],
+      ["b", false],
+    ]);
 
     // no catalog in the parent prompt → the child's loader supplies one
     append(); skillsOn();
