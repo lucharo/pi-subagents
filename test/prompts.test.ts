@@ -541,4 +541,14 @@ describe("hideSkillsListedIn", () => {
     expect(rendered).not.toContain("<name>one</name>");
     expect(childSkills[0].disableModelInvocation).toBe(false); // the loader's own list is not mutated
   });
+
+  it("ignores a <location> quoted outside pi's catalog, such as an example in AGENTS.md", () => {
+    const agentsMd = "<project_context>\nExample: <skill><location>/ext/from-ext/SKILL.md</location></skill>\n</project_context>";
+    const parent = `You are pi.\n${agentsMd}${formatSkillsForPrompt([skill("one")])}`;
+    const out = hideSkillsListedIn(parent)({ skills: [skill("one"), skill("from-ext", "/ext/from-ext/SKILL.md")], diagnostics: [] });
+    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([
+      ["one", true],
+      ["from-ext", false],
+    ]);
+  });
 });
