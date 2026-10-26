@@ -36,6 +36,19 @@ export interface PromptExtras {
 }
 
 /**
+ * The parent's prompt with its `<skills>` section removed.
+ *
+ * In append mode the parent prompt is inlined verbatim, and it already carries pi's
+ * `<skills>` section (the whole `<available_skills>` list). When the child also loads
+ * skills itself, pi appends its own `<skills>` section after the override, so without
+ * this the list appears twice: about 40k tokens per spawn with a few hundred skills.
+ * The child's own section is the one to keep, since it reflects the child's skill config.
+ */
+export function withoutSkillsSection(parentSystemPrompt: string): string {
+  return parentSystemPrompt.replace(/\n*<skills>\n[\s\S]*?\n<\/skills>/, "");
+}
+
+/**
  * Build the system prompt for an agent from its config.
  *
  * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)

@@ -99,7 +99,8 @@ vi.mock("../src/env.js", () => ({
   detectEnv: vi.fn(async () => ({ isGitRepo: false, branch: "", platform: "linux" })),
 }));
 
-vi.mock("../src/prompts.js", () => ({
+vi.mock("../src/prompts.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/prompts.js")>()),
   buildAgentPrompt: vi.fn(() => "system prompt"),
 }));
 
@@ -274,6 +275,26 @@ describe("agent-runner final output capture", () => {
 
     await runAgent(ctx, "Explore", "Say ISOLATED", { pi });
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("worktreeBase");
+  });
+
+  it("drops the inherited <skills> section when the child loads skills itself, and keeps it otherwise", async () => {
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    const parent = "preamble\n\n<rules>\n- r\n</rules>\n\n<skills>\nThe following skills...\n<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>\n/tmp\n</cwd>";
+    const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
+    const { session } = createSession("ONCE");
+    createAgentSession.mockResolvedValue({ session });
+
+    // skills: true → pi appends its own <skills> section, so the inherited copy goes.
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true }));
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe("preamble\n\n<rules>\n- r\n</rules>\n\n<cwd>\n/tmp\n</cwd>");
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false }));
+
+    // isolated → noSkills, pi appends nothing, so the inherited list is left as it was.
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true }));
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi, isolated: true });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: true }));
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {

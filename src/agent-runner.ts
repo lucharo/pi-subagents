@@ -24,7 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, type PromptExtras, withoutSkillsSection } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -637,7 +637,7 @@ export async function runAgent(
   const env = await detectEnv(options.pi, effectiveCwd);
 
   // Get parent system prompt for append-mode agents
-  const parentSystemPrompt = ctx.getSystemPrompt();
+  let parentSystemPrompt = ctx.getSystemPrompt();
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
@@ -658,6 +658,14 @@ export async function runAgent(
       extras.skillBlocks = loaded;
     }
   }
+
+  // When skills is string[], we've already preloaded them into the prompt.
+  // Still pass noSkills: true since we don't need the skill loader to load them again.
+  const noSkills = skills === false || Array.isArray(skills);
+
+  // A child that loads skills gets pi's own <skills> section appended after the
+  // override; drop the copy inherited with the parent prompt so the list appears once.
+  if (!noSkills && parentSystemPrompt) parentSystemPrompt = withoutSkillsSection(parentSystemPrompt);
 
   let toolNames = getToolNamesForType(type);
 
@@ -693,10 +701,6 @@ export async function runAgent(
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
     systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
   }
-
-  // When skills is string[], we've already preloaded them into the prompt.
-  // Still pass noSkills: true since we don't need the skill loader to load them again.
-  const noSkills = skills === false || Array.isArray(skills);
 
   const agentDir = getAgentDir();
 

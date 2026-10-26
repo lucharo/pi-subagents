@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt } from "../src/prompts.js";
+import { buildAgentPrompt, withoutSkillsSection } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -485,5 +485,16 @@ describe("buildAgentPrompt", () => {
       expect(prompt).toContain("<worktree_isolation>");
       expect(prompt.indexOf("<workflow_child>")).toBeGreaterThan(prompt.indexOf("<worktree_isolation>"));
     });
+  });
+});
+
+describe("withoutSkillsSection", () => {
+  it("removes only pi's <skills> section, with the blank line before it", () => {
+    const prompt = "pre\n\n<rules>\nx\n</rules>\n\n<skills>\nlist\n<available_skills>\n  <skill>\n    <name>a &lt;b&gt;</name>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>\n/w\n</cwd>";
+    expect(withoutSkillsSection(prompt)).toBe("pre\n\n<rules>\nx\n</rules>\n\n<cwd>\n/w\n</cwd>");
+  });
+
+  it("leaves a prompt without a skills section unchanged", () => {
+    expect(withoutSkillsSection("pre\n\n<cwd>\n/w\n</cwd>")).toBe("pre\n\n<cwd>\n/w\n</cwd>");
   });
 });
