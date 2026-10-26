@@ -1,3 +1,4 @@
+import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
 import { buildAgentPrompt, withoutSkillsSection } from "../src/prompts.js";
@@ -492,6 +493,24 @@ describe("withoutSkillsSection", () => {
   it("removes only pi's <skills> section, with the blank line before it", () => {
     const prompt = "pre\n\n<rules>\nx\n</rules>\n\n<skills>\nlist\n<available_skills>\n  <skill>\n    <name>a &lt;b&gt;</name>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>\n/w\n</cwd>";
     expect(withoutSkillsSection(prompt)).toBe("pre\n\n<rules>\nx\n</rules>\n\n<cwd>\n/w\n</cwd>");
+  });
+
+  it("removes the bare catalog the pinned pi's formatSkillsForPrompt appends", () => {
+    const skill = (name: string) => ({
+      name,
+      description: `Use for ${name} <work>.`,
+      filePath: `/skills/${name}/SKILL.md`,
+      baseDir: `/skills/${name}`,
+      sourceInfo: {} as never,
+      disableModelInvocation: false,
+    });
+    const catalog = formatSkillsForPrompt([skill("one"), skill("two")]);
+    expect(catalog).toContain("<available_skills>");
+    const parent = `You are pi.\n\nGuidelines:\n- be concise${catalog}\nCurrent working directory: /w`;
+    const stripped = withoutSkillsSection(parent);
+    expect(stripped).toBe("You are pi.\n\nGuidelines:\n- be concise\nCurrent working directory: /w");
+    // A child that loads skills gets the formatter's catalog appended once more: one copy in total.
+    expect((stripped + catalog).split("<available_skills>").length - 1).toBe(1);
   });
 
   it("leaves a prompt without a skills section unchanged", () => {
