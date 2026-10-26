@@ -99,7 +99,8 @@ vi.mock("../src/env.js", () => ({
   detectEnv: vi.fn(async () => ({ isGitRepo: false, branch: "", platform: "linux" })),
 }));
 
-vi.mock("../src/prompts.js", () => ({
+vi.mock("../src/prompts.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/prompts.js")>()),
   buildAgentPrompt: vi.fn(() => "system prompt"),
 }));
 
@@ -274,6 +275,45 @@ describe("agent-runner final output capture", () => {
 
     await runAgent(ctx, "Explore", "Say ISOLATED", { pi });
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("worktreeBase");
+  });
+
+  it("renders no second skills catalog when an append-mode child inherits the parent's", async () => {
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    const catalog = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n    <location>/skills/a/SKILL.md</location>\n  </skill>\n</available_skills>";
+    const parent = `preamble${catalog}\nCurrent working directory: /tmp`;
+    const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
+    const { session } = createSession("ONCE");
+    createAgentSession.mockResolvedValue({ session });
+    const append = () => vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
+    const skillsOn = () => vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true, promptMode: "append" }));
+
+    // append + skills: true + a parent catalog → the parent's prompt stays as it is; skills still load, hidden from the catalog
+    append(); skillsOn();
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
+    const opts = defaultResourceLoaderCtor.mock.lastCall![0];
+    expect(opts.noSkills).toBe(false);
+    const hidden = opts.skillsOverride({
+      skills: [
+        { name: "a", filePath: "/skills/a/SKILL.md", disableModelInvocation: false },
+        { name: "b", filePath: "/skills/b/SKILL.md", disableModelInvocation: false },
+      ],
+      diagnostics: [],
+    });
+    expect(hidden.skills.map((s: { name: string; disableModelInvocation: boolean }) => [s.name, s.disableModelInvocation])).toEqual([
+      ["a", true],
+      ["b", false],
+    ]);
+
+    // no catalog in the parent prompt → the child's loader supplies one
+    append(); skillsOn();
+    await runAgent({ ...ctx, getSystemPrompt: vi.fn(() => "preamble") }, "general-purpose", "Do it", { pi });
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
+
+    // replace mode never inlines the parent prompt → the child's loader supplies one
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "replace" })); skillsOn();
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi });
+    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {

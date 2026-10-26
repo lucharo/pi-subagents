@@ -36,6 +36,36 @@ export interface PromptExtras {
 }
 
 /**
+ * Whether a prompt carries pi's own skills catalog: the formatter's fixed preamble line followed by
+ * `<available_skills>`. Both renderings have it (pi 1.x inside a `<skills>` section, pi 0.84 bare), and a
+ * `<skills>` block someone writes in AGENTS.md does not.
+ */
+const SKILLS_CATALOG = /The following skills provide specialized instructions for specific tasks\.[\s\S]*?<available_skills>[\s\S]*?<\/available_skills>/g;
+
+export function hasSkillsCatalog(prompt: string | undefined): boolean {
+  return !!prompt && /The following skills provide specialized instructions for specific tasks\.[\s\S]*?<available_skills>/.test(prompt);
+}
+
+const unescapeXml = (text: string) =>
+  text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+
+/**
+ * A `skillsOverride` for the child's resource loader that keeps every skill loaded but marks the ones the
+ * inherited catalog already lists (by `<location>`) `disableModelInvocation`, so pi renders only the child's
+ * own additions. `/skill:name` still expands (the registry is intact), and skills that extensions add while
+ * binding go through the same override: one the parent already lists is hidden, one only the child has stays.
+ */
+export function hideSkillsListedIn(parentSystemPrompt: string) {
+  // only entries inside pi's own catalog(s), never a <location> quoted elsewhere (an XML example in AGENTS.md)
+  const catalogs = [...parentSystemPrompt.matchAll(SKILLS_CATALOG)].map((m) => m[0]).join("\n");
+  const listed = new Set([...catalogs.matchAll(/<location>([^<]*)<\/location>/g)].map((m) => unescapeXml(m[1])));
+  return <S extends { filePath: string; disableModelInvocation: boolean }, D>(base: { skills: S[]; diagnostics: D[] }) => ({
+    ...base,
+    skills: base.skills.map((skill) => (listed.has(skill.filePath) ? { ...skill, disableModelInvocation: true } : skill)),
+  });
+}
+
+/**
  * Build the system prompt for an agent from its config.
  *
  * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)

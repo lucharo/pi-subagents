@@ -24,7 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -659,6 +659,15 @@ export async function runAgent(
     }
   }
 
+  // When skills is string[], we've already preloaded them into the prompt.
+  // Still pass noSkills: true since we don't need the skill loader to load them again.
+  const noSkills = skills === false || Array.isArray(skills);
+  // An append-mode child with skills: true inherits the parent prompt verbatim, catalog included
+  // (with any skill the parent got from --skill, which the child's loader would not find). Its own
+  // loader still loads skills, so /skill:name expands, but renders only the ones the parent's lacks.
+  const appendMode = (agentConfig?.promptMode ?? "append") === "append";
+  const inheritsCatalog = skills === true && appendMode && hasSkillsCatalog(parentSystemPrompt);
+
   let toolNames = getToolNamesForType(type);
 
   // Persistent memory: detect write capability and branch accordingly.
@@ -693,10 +702,6 @@ export async function runAgent(
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
     systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
   }
-
-  // When skills is string[], we've already preloaded them into the prompt.
-  // Still pass noSkills: true since we don't need the skill loader to load them again.
-  const noSkills = skills === false || Array.isArray(skills);
 
   const agentDir = getAgentDir();
 
@@ -763,6 +768,7 @@ export async function runAgent(
     additionalExtensionPaths,
     extensionsOverride,
     noSkills,
+    skillsOverride: inheritsCatalog ? hideSkillsListedIn(parentSystemPrompt) : undefined,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,

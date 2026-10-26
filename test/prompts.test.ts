@@ -1,6 +1,7 @@
+import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt } from "../src/prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -485,5 +486,69 @@ describe("buildAgentPrompt", () => {
       expect(prompt).toContain("<worktree_isolation>");
       expect(prompt.indexOf("<workflow_child>")).toBeGreaterThan(prompt.indexOf("<worktree_isolation>"));
     });
+  });
+});
+
+describe("hasSkillsCatalog", () => {
+  const skill = (name: string) => ({
+    name,
+    description: `Use for ${name} <work>.`,
+    filePath: `/skills/${name}/SKILL.md`,
+    baseDir: `/skills/${name}`,
+    sourceInfo: {} as never,
+    disableModelInvocation: false,
+  });
+
+  it("finds the bare catalog the pinned pi's formatSkillsForPrompt appends", () => {
+    const catalog = formatSkillsForPrompt([skill("one"), skill("two")]);
+    expect(hasSkillsCatalog(`You are pi.${catalog}\nCurrent working directory: /w`)).toBe(true);
+  });
+
+  it("finds pi 1.x's <skills> section, which wraps the same formatter output", () => {
+    const catalog = formatSkillsForPrompt([skill("one")]).trim();
+    expect(hasSkillsCatalog(`pre\n\n<rules>\nx\n</rules>\n\n<skills>\n${catalog}\n</skills>\n\n<cwd>\n/w\n</cwd>`)).toBe(true);
+  });
+
+  it("ignores a <skills> block written in project instructions, and an empty prompt", () => {
+    expect(hasSkillsCatalog("<project_context>\n<skills>\n- use tdd\n</skills>\n</project_context>")).toBe(false);
+    expect(hasSkillsCatalog("")).toBe(false);
+    expect(hasSkillsCatalog(undefined)).toBe(false);
+  });
+});
+
+describe("hideSkillsListedIn", () => {
+  const skill = (name: string, filePath = `/skills/${name}/SKILL.md`) => ({
+    name,
+    description: `Use for ${name}.`,
+    filePath,
+    baseDir: filePath.replace(/\/SKILL\.md$/, ""),
+    sourceInfo: {} as never,
+    disableModelInvocation: false,
+  });
+
+  it("hides the skills the inherited catalog lists and keeps the child's own visible", () => {
+    const parent = `You are pi.${formatSkillsForPrompt([skill("one"), skill("a&b", "/skills/a&b/SKILL.md")])}`;
+    const childSkills = [skill("one"), skill("a&b", "/skills/a&b/SKILL.md"), skill("from-ext", "/ext/from-ext/SKILL.md")];
+    const out = hideSkillsListedIn(parent)({ skills: childSkills, diagnostics: [] });
+    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([
+      ["one", true],
+      ["a&b", true],
+      ["from-ext", false],
+    ]);
+    // pi renders only the child-only skill, so no entry appears twice
+    const rendered = formatSkillsForPrompt(out.skills);
+    expect(rendered).toContain("<name>from-ext</name>");
+    expect(rendered).not.toContain("<name>one</name>");
+    expect(childSkills[0].disableModelInvocation).toBe(false); // the loader's own list is not mutated
+  });
+
+  it("ignores a <location> quoted outside pi's catalog, such as an example in AGENTS.md", () => {
+    const agentsMd = "<project_context>\nExample: <skill><location>/ext/from-ext/SKILL.md</location></skill>\n</project_context>";
+    const parent = `You are pi.\n${agentsMd}${formatSkillsForPrompt([skill("one")])}`;
+    const out = hideSkillsListedIn(parent)({ skills: [skill("one"), skill("from-ext", "/ext/from-ext/SKILL.md")], diagnostics: [] });
+    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([
+      ["one", true],
+      ["from-ext", false],
+    ]);
   });
 });
