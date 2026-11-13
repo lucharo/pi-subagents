@@ -71,7 +71,7 @@ describe("agent type registry", () => {
     it("case-insensitive lookup works for getAgentConfig", () => {
       const config = getAgentConfig("explore");
       expect(config?.name).toBe("Explore");
-      expect(config?.model).toBe("anthropic/claude-haiku-4-5");
+      expect(config?.model).toBeUndefined();
     });
 
     it("resolveType returns canonical key or undefined", () => {
@@ -96,9 +96,9 @@ describe("agent type registry", () => {
       expect(config.builtinToolNames).not.toContain("write");
     });
 
-    it("Explore has haiku model in config", () => {
+    it("Explore pins no model, so it runs on the session's", () => {
       const cfg = getAgentConfig("Explore");
-      expect(cfg?.model).toBe("anthropic/claude-haiku-4-5");
+      expect(cfg?.model).toBeUndefined();
     });
 
     it("default agents are marked isDefault", () => {
