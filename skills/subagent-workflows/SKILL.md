@@ -28,6 +28,19 @@ Keep finders, merge and verify in one script. `pipeline()` sends each item throu
 
 After every `schema` stage, drop the nulls before using the results: `results.filter(Boolean)`. A null is an agent that failed, was skipped, or never answered through the schema.
 
+## Size a run before you start it
+
+- **Every finished agent stays loaded in the parent Pi until the run ends.** One verify-per-item sweep of 543 items
+  held 529 finished agents at once: the parent Pi grew to 1.4–2.1 GB at 67–85% CPU, the user could not open the
+  conversation, and it fed a whole-machine freeze (12 Nov 2026). Keep one run to about 100 agents; for more items,
+  split them over several runs, each passed its slice in `args`.
+- **Cap concurrency yourself.** `pipeline()` and `parallel()` start up to the runtime's cap (16) at once. On a shared
+  or loaded machine run a stage in batches (`for` over slices of 4 with `parallel()` inside).
+- **Reloading Pi does not stop a run.** It went on for hours after `reload_pi`. Stop it from the Workflows view.
+- **To finish a run's last few items, start a small new run over just those items**, built from the journal (the
+  items with no verdict), rather than resuming: a resume reruns every `agent()` call from the first changed one, so an
+  edited stage near the end of a big run is cheap only if nothing before it changed.
+
 ## When a run fails or needs changes
 
 1. Read the run's journal before diagnosing it: the `Journal:` path the tool returned (`<run id>.workflow.jsonl`). It records every agent's actual return value. A run's `run.json` (final snapshot and result) is under `<agent dir>/subagents/<session id>/<run id>/`.
