@@ -15,7 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -279,6 +279,11 @@ interface SpawnOptions {
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
   /**
+   * The commit the worktree is created from, instead of HEAD. Internal: set by
+   * `reopen` so a resumed isolated child starts from its own saved branch.
+   */
+  worktreeFrom?: string;
+  /**
    * Working directory for the agent (absolute path). Default: parent session
    * cwd. The agent's tools operate here, but .pi config (extensions, skills,
    * settings, memory) still loads from the parent session's project — the
@@ -363,6 +368,15 @@ interface ResumeOptions {
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
   /**
+   * Foreground resume only: called with the session the resumed turn runs in,
+   * before the turn starts — the live one, or the one reopened from the child's
+   * session file when its session was shut down at settle (a workflow child,
+   * see `releaseSettledSession`). Where a caller re-attaches per-run wiring
+   * (transcript stream, tool-call follower), since a reopened session is a new
+   * object the caller has never seen.
+   */
+  onSession?: (session: AgentSession) => void;
+  /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
    * (output-file streaming) here rather than at the call site, so a resume that
@@ -445,6 +459,18 @@ export class AgentManager {
    * held record; `dispose()` does not.
    */
   private holds = new Map<string, Set<string>>();
+
+  /**
+   * How each workflow child was spawned, by record id: what reopening its
+   * conversation needs once its session has been shut down at settle. A run can
+   * spawn hundreds of children and keeping each one's live `AgentSession` (its
+   * extension instances, their timers, the tool objects, the system prompt) for
+   * as long as the run lives grew a parent Pi past 2 GB (#4). So a settled child
+   * keeps only its record, and a later `agent({ resume })` reopens its session
+   * file through the same `startAgent` path it first ran on. Holds no session —
+   * the context, the agent type, and the spawn options are shared or small.
+   */
+  private reopenArgs = new Map<string, SpawnArgs>();
 
   /**
    * When the last hold on a record was released. The ten-minute window restarts
@@ -739,6 +765,7 @@ export class AgentManager {
     }
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    if (record.workflowId !== undefined) this.reopenArgs.set(id, args);
 
     const pool = this.poolFor(record);
     if (pool !== undefined && !options.bypassQueue && !this.poolHasRoom(pool)) {
@@ -825,6 +852,7 @@ export class AgentManager {
           this.agents.delete(id);
           this.holds.delete(id);
           this.releasedAt.delete(id);
+          this.reopenArgs.delete(id);
         }
         // The agent never kept its slot (startAgent gives it back on failure),
         // so anything queued behind it can go now.
@@ -900,7 +928,9 @@ export class AgentManager {
     // that omits the field can't stop a caller that never saw the schema.
     let worktreeCwd: string | undefined;
     if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
+      const wt = options.worktreeFrom === undefined
+        ? await createWorktree(pi, baseCwd, id)
+        : await createWorktree(pi, baseCwd, id, options.worktreeFrom);
       if (!wt) {
         releaseSlot();
         throw new Error(
@@ -961,9 +991,17 @@ export class AgentManager {
       }
       this.abortOwnedChildren(id);
       this.settleRun(record, true, pool);
+      this.releaseSettledSession(record);
       cutLoose();
     });
     const touch = () => this.touchRun(id);
+    // This invocation's own worktree and controller. A stopped run can end late,
+    // after the record was resumed (`reopen`) into a newer invocation with a
+    // worktree of its own: the late ending must clean up only its own tree and
+    // write nothing over the newer one's outcome.
+    const ownWorktree = record.worktree;
+    const controller = record.abortController;
+    const superseded = () => record.abortController !== controller;
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -1014,8 +1052,10 @@ export class AgentManager {
       },
       onSessionCreated: (session) => {
         // Arrived after the stall check settled the run, and after cleanup took
-        // the record: nobody will dispose it, so shut it down here.
-        if (watch.settled && this.agents.get(id) !== record) {
+        // the record: nobody will dispose it, so shut it down here. A workflow
+        // child's session is shut down at settle, so one that arrives after the
+        // settle is shut down at once too.
+        if (watch.settled && (this.agents.get(id) !== record || record.workflowId !== undefined)) {
           void shutdownChildSession(session);
           return;
         }
@@ -1092,6 +1132,10 @@ export class AgentManager {
           record.structuredJson = structuredJson;
           record.structuredRetried = structuredRetried;
           record.session = session;
+          // Normally captured at session creation; read again here for a session
+          // that never reported itself, since this path is what reopening the
+          // conversation of a released workflow child goes through.
+          record.sessionFile ??= session?.sessionManager?.getSessionFile?.();
           record.completedAt ??= Date.now();
         }
 
@@ -1103,19 +1147,19 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Clean up worktree if used
-        if (record.worktree) {
+        // Clean up worktree if used — this invocation's own, never a newer one's.
+        if (ownWorktree) {
           // The one moment the child's tree still exists and the child is done
           // writing to it. try/catch, not decoration: a hook that throws must
           // not leave the worktree behind.
           if (options.onBeforeWorktreeCleanup) {
             try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
+              await options.onBeforeWorktreeCleanup(ownWorktree.path);
             } catch { /* ignore — never block cleanup */ }
           }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch && !late()) {
+          const wtResult = await cleanupWorktree(pi, baseCwd, ownWorktree, options.description);
+          if (!superseded()) record.worktreeResult = wtResult;
+          if (wtResult.hasChanges && wtResult.branch && !late() && !superseded()) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -1129,7 +1173,10 @@ export class AgentManager {
 
         if (!late()) this.abortOwnedChildren(id);
 
-        if (this.claimRun(id, watch)) this.settleRun(record, true, pool);
+        if (this.claimRun(id, watch)) {
+          this.settleRun(record, true, pool);
+          this.releaseSettledSession(record);
+        }
         return responseText;
       })
       .catch(async (err) => {
@@ -1150,17 +1197,23 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Best-effort worktree cleanup on error
-        if (record.worktree) {
+        // Best-effort worktree cleanup on error — this invocation's own.
+        if (ownWorktree) {
           try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
+            const wtResult = await cleanupWorktree(pi, baseCwd, ownWorktree, options.description);
+            if (!superseded()) record.worktreeResult = wtResult;
           } catch { /* ignore cleanup errors */ }
         }
 
         if (!watch.settled) this.abortOwnedChildren(id);
 
-        if (this.claimRun(id, watch)) this.settleRun(record, false, pool);
+        if (this.claimRun(id, watch)) {
+          try {
+            this.settleRun(record, false, pool);
+          } finally {
+            this.releaseSettledSession(record);
+          }
+        }
         return "";
       });
 
@@ -1212,6 +1265,96 @@ export class AgentManager {
     // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
     // about reachability, and matching the old condition needs no such claim.
     if (record.isBackground || pool !== undefined) this.drainQueue();
+  }
+
+  /**
+   * Shut a settled workflow child's session down and keep only its record (#4):
+   * status, result or structured output, usage, timings, and the paths of its
+   * session file and `.output` transcript. Its extension instances get their
+   * `session_shutdown`, so the timers and watchers they armed stop, and the
+   * session's listeners and in-memory entries go with it.
+   *
+   * Workflow children only. A run can spawn hundreds and holds every one for as
+   * long as it lives; a top-level agent is one the user started and may resume
+   * or open by name, and the ten-minute cleanup already bounds those.
+   *
+   * A later `resume` reopens the session file (`reopen`), so nothing a script
+   * can do with a finished child is lost — except for a child whose session was
+   * never saved to disk (`persist_session: false`, or `rememberAgents` off),
+   * which then cannot be resumed and says so.
+   */
+  private releaseSettledSession(record: AgentRecord): void {
+    if (record.workflowId === undefined) return;
+    const session = record.session;
+    if (session === undefined) return;
+    record.session = undefined;
+    void shutdownChildSession(session);
+  }
+
+  /**
+   * Continue a released workflow child's conversation: reopen its session file
+   * and run `prompt` in it, through the same `startAgent` path its first run
+   * took — same agent type, model and options — on the same record, so its id,
+   * usage and tool count carry on. The new session is released again when the
+   * turn settles.
+   */
+  private async reopen(
+    id: string,
+    record: AgentRecord,
+    prompt: string,
+    signal: AbortSignal | undefined,
+    options: ResumeOptions | undefined,
+  ): Promise<AgentRecord> {
+    const base = this.reopenArgs.get(id)!;
+    record.result = undefined;
+    record.error = undefined;
+    record.completedAt = undefined;
+    record.structuredJson = undefined;
+    record.structuredRetried = undefined;
+    // Already committed and removed by the first run's settle; left set, this
+    // run's settle would try to clean it up a second time.
+    record.worktree = undefined;
+    record.promise = undefined;
+    record.abortController = new AbortController();
+    const args: SpawnArgs = {
+      ...base,
+      prompt,
+      options: {
+        ...base.options,
+        resumeSessionFile: record.sessionFile,
+        // An isolated child continues from the branch its last run's changes
+        // were saved to, so the work it remembers doing is in its tree.
+        worktreeFrom: record.worktreeResult?.hasChanges ? record.worktreeResult.branch : undefined,
+        signal,
+        invocation: record.invocation,
+        // The first run's hooks belong to its own call: its spawn callbacks, its
+        // gate. A resume runs no gate, as on a live session.
+        onSpawned: undefined,
+        onQueued: undefined,
+        onBeforeWorktreeCleanup: undefined,
+        onSessionCreated: options?.onSession,
+        onToolActivity: options?.onToolActivity,
+        onTextDelta: undefined,
+        onTurnEnd: undefined,
+        onAssistantUsage: options?.onAssistantUsage,
+        onCompaction: options?.onCompaction,
+      },
+    };
+    const startup = this.startAgent(id, record, args);
+    // So waitForAll() waits on a reopen still creating its worktree.
+    this.startups.set(id, startup.catch(() => {}));
+    try {
+      await startup;
+    } catch (err) {
+      record.status = "error";
+      record.error = err instanceof Error ? err.message : String(err);
+      record.completedAt = Date.now();
+      return record;
+    } finally {
+      this.startups.delete(id);
+    }
+    if (record.promise) await record.promise;
+    return record;
   }
 
   /**
@@ -1340,12 +1483,25 @@ export class AgentManager {
     options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    if (!record) return undefined;
     // The previous invocation has not wound down yet (a stop it ignored, still
     // inside its grace): resuming now would replace its watch and leave it
     // unwatched, its slot and awaiters never settled.
     const prior = this.watches.get(id);
     if (prior && !prior.settled) return undefined;
+    if (!record.session) {
+      // A workflow child whose session was shut down at settle: reopen it from
+      // its session file. Foreground only — a workflow resumes inline.
+      if (
+        options?.isBackground
+        || record.sessionFile === undefined
+        || !existsSync(record.sessionFile)
+        || !this.reopenArgs.has(id)
+        || record.status === "running"
+        || record.status === "queued"
+      ) return undefined;
+      return this.reopen(id, record, prompt, signal, options);
+    }
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1424,6 +1580,7 @@ export class AgentManager {
     const watch = this.watchRun(id, () => cutLoose());
     this.followSession(id, watch, record.session);
     const touch = () => this.touchRun(id);
+    try { options?.onSession?.(record.session); } catch { /* caller wiring never breaks a resume */ }
 
     // The whole turn, published as `record.promise` before the first await:
     // waitForAll() and anything else awaiting the record waits on THIS turn,
@@ -1479,6 +1636,7 @@ export class AgentManager {
       // Same contract as the spawn settle paths: children spawned during the
       // resumed turn must not outlive it — nothing else can see or reach them.
       this.abortOwnedChildren(id);
+      this.releaseSettledSession(record);
     })();
     record.promise = turn.then(() => record.result ?? "");
     await turn;
@@ -1757,6 +1915,7 @@ export class AgentManager {
     this.watches.delete(id);
     this.holds.delete(id);
     this.releasedAt.delete(id);
+    this.reopenArgs.delete(id);
     this.tombstone(record);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
@@ -1905,6 +2064,7 @@ export class AgentManager {
     this.startups.clear();
     this.holds.clear();
     this.releasedAt.clear();
+    this.reopenArgs.clear();
     for (const watch of this.watches.values()) watch.off?.();
     this.watches.clear();
     if (pi) {

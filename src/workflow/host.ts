@@ -34,7 +34,9 @@
  *     records ten minutes after they settle, but a script may resume a child
  *     much later (fix, then a long review, then resume the fixer). So every
  *     child is held on the manager for as long as the run lives, and the
- *     caller hands the holds back with `release()` once the run settles.
+ *     caller hands the holds back with `release()` once the run settles. A
+ *     hold keeps the record only: the manager shuts the child's session down
+ *     when it settles, and a resume reopens it from its session file (#4).
  */
 
 import { existsSync } from "node:fs";
@@ -79,8 +81,17 @@ export interface WorkflowHostOptions {
    * an `.output` transcript and to follow their tool calls for the snapshot.
    */
   onChildSession?: (recordId: string, session: AgentSession, prompt: string) => void;
-  /** Fork addition: called before a settled child is resumed (`agent({ resume })`), with its live session. */
+  /**
+   * Fork addition: called before a settled child is resumed (`agent({ resume })`), with the session the
+   * resumed turn runs in. The manager shuts a workflow child's session down when it settles, so this is
+   * normally a new session, reopened from the child's session file.
+   */
   onChildResume?: (recordId: string, session: AgentSession) => void;
+  /**
+   * Fork addition: called once a child's spawn or resume has settled. Its session has been shut down by
+   * then (#4), so anything still subscribed to it must let go here, or the session stays reachable.
+   */
+  onChildSettled?: (recordId: string) => void;
 }
 
 /**
@@ -401,6 +412,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
             reportResolved();
           },
         );
+        try { deps.onChildSettled?.(record.id); } catch { /* observers never break a run */ }
         return { ...toSpawnResult(record), ...(gate !== undefined ? { gate } : {}) };
       } catch (error) {
         // Strict worktree isolation rejects out of `awaitStartup` — the child
@@ -424,17 +436,33 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      const live = manager.getRecord(id)?.session;
-      if (live) {
-        try { deps.onChildResume?.(id, live); } catch { /* observers never break a run */ }
-      }
-      const record = await manager.resume(id, prompt, deps.signal);
+      const record = await manager.resume(id, prompt, deps.signal, {
+        onSession: session => {
+          try { deps.onChildResume?.(id, session); } catch { /* observers never break a run */ }
+        },
+      });
       if (record === undefined) {
+        const known = manager.getRecord(id);
+        // Its session was shut down when it settled, and there is no file to
+        // reopen it from: say what would have made it resumable.
+        const released = known !== undefined && known.session === undefined;
+        const unsaved = released && known.sessionFile === undefined;
+        // Saved, but the file is gone: a `session_dir` inside the child's own
+        // worktree is removed with that worktree when the child settles.
+        const gone = released && known.sessionFile !== undefined && !existsSync(known.sessionFile);
         return {
           ok: false,
-          error: `Agent ${id} has no session to resume.`,
+          error: unsaved
+            ? `Agent ${id} finished and its conversation was not saved to disk, so it cannot be resumed. ` +
+              "Resuming a finished workflow agent reopens its session file: set `persist_session: true` on its agent, " +
+              "or turn the rememberAgents setting back on."
+            : gone
+              ? `Agent ${id} finished and its session file is gone (${known.sessionFile}), so it cannot be resumed. ` +
+                "Keep its session_dir outside the agent's worktree."
+              : `Agent ${id} has no session to resume.`,
         };
       }
+      try { deps.onChildSettled?.(id); } catch { /* observers never break a run */ }
       // The resumed row is built from scratch, so it has to be told the same
       // thing the first one was — the child's session already exists, so this is
       // simply read back rather than waited for. The id goes first for the same

@@ -162,7 +162,8 @@ export class ConversationViewer implements Component {
 
   constructor(
     private tui: TUI,
-    private session: AgentSession,
+    /** A live session, or a settled agent's conversation read back from disk (no events). */
+    private session: Pick<AgentSession, "messages" | "subscribe">,
     private record: AgentRecord,
     private activity: AgentActivity | undefined,
     private theme: Theme,
