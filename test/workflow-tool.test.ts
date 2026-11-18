@@ -548,7 +548,7 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     await host.spawnAgent(request({ agentId: "wf-agent-0" }));
     const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
 
-    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined);
+    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined, { onSession: expect.any(Function) });
     expect(resumed).toMatchObject({ ok: true, text: "resumed" });
   });
 

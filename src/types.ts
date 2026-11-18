@@ -177,6 +177,11 @@ export interface AgentRecord {
   toolUses: number;
   startedAt: number;
   completedAt?: number;
+  /**
+   * The live session. A workflow child's is shut down and cleared when it
+   * settles (#4): read a finished child from `result`, `sessionFile` or
+   * `outputFile` instead.
+   */
   session?: AgentSession;
   abortController?: AbortController;
   promise?: Promise<string>;

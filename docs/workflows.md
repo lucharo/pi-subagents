@@ -107,7 +107,7 @@ Every run journals each settled `agent()` call beside its script as `<run id>.wo
 Four things it will not do:
 
 - **Cross sessions.** The journal is keyed to the session that wrote it. Restart pi and the run id is dead — you get `No workflow run "<id>" in this session.`
-- **Resume a live run.** Stop it from `/agents → Workflows` first; while it is running you get `Workflow "<id>" is still running.`
+- **Resume a live run.** Stop it first, from `/agents → Workflows` or with `SubagentWorkflow({ stop: "<run id>" })`; while it is running you get `Workflow "<id>" is still running.`
 - **Replay a failure.** A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. That is the point.
 - **Replay a run that used `agent({ resume })` at all.** A replayed agent is text from a file rather than a live child, so there would be no conversation left for a later `resume` to continue.
 
@@ -225,9 +225,10 @@ export const meta = {
 | `name` | string | A saved workflow — `<name>.js` in one of the three directories above. Lowest precedence |
 | `args` | any | Handed to the script as the `args` global, verbatim. Must be JSON-shaped |
 | `resumeFromRunId` | string | Replay an earlier run in this session. Matches `^wf_[a-z0-9-]{6,}$` |
+| `stop` | string | Stop a run of this session by its id: its running agents are stopped, it settles as stopped and notifies as usual. Nothing else in the call is read |
 | `title` / `description` | string | Accepted and ignored — for Claude Code parity, so a ported call does not fail. A workflow is named by its `meta` block |
 
-At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
+At least one of `script` / `scriptPath` / `name` is required, unless the call is a `stop`; `scriptPath` wins over `script`, which wins over `name`.
 
 ### `agent(prompt, opts?)`
 
@@ -250,6 +251,8 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+
+A finished child keeps only its record: result, usage, timings, and the paths of its session file and `.output` transcript. Its session is shut down when it settles, so a run of hundreds of agents does not keep hundreds of sessions, and their extensions, alive. `resume` reopens that session file, so it needs one: an agent with `persist_session: false`, or run with the `rememberAgents` setting off, cannot be resumed once it has finished, and the call says so. An isolated child resumes in a fresh worktree, since its first one was committed to a branch and removed.
 
 ### `pipeline()` and `parallel()`
 

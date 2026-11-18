@@ -81,6 +81,9 @@ describe("the inspector opens a workflow agent's conversation", () => {
     hermetic = hermeticDir({ settings: { workflowsEnabled: true } });
     vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
       const session = fakeSession();
+      // After a tick, as the real `runAgent` does (it loads extensions first): the
+      // host only wires a child's `.output` transcript once it knows the record id.
+      await new Promise(resolve => setImmediate(resolve));
       opts.onSessionCreated?.(session as any);
       return { responseText: "child done", session: session as any, aborted: false, steered: false };
     });
@@ -130,6 +133,9 @@ describe("the inspector opens a workflow agent's conversation", () => {
     // A second overlay, on the viewer's own terms — not the dialog reused.
     expect(ui.overlays[1].options.overlay).toBe(true);
     expect(ui.overlays[1].instance.constructor.name).toBe("ConversationViewer");
+    // The child settled, so its session is gone (#4): the conversation is read
+    // back from its `.output` transcript.
+    expect(ui.overlays[1].instance.render?.(120).join("\n")).toContain("read the routes");
     // ...with the dialog hidden underneath it: the two frames size themselves
     // to different content, so the taller one's edges would show around the
     // shorter.

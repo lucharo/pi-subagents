@@ -17,7 +17,7 @@ vi.mock("../src/agent-runner.js", () => ({
 }));
 
 import { AgentManager } from "../src/agent-manager.js";
-import { resumeAgent, runAgent } from "../src/agent-runner.js";
+import { runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
@@ -40,13 +40,14 @@ describe("a live workflow run keeps the records it may resume", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     registerAgents(new Map());
-    vi.mocked(runAgent).mockImplementation(async () => ({
-      responseText: "done",
-      session: { dispose: vi.fn() } as any,
+    // A finished child's session is shut down at settle (#4), and a resume
+    // reopens its session file: the second `runAgent` call is the resume.
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => ({
+      responseText: opts.resumeSessionFile ? "fixed the findings" : "done",
+      session: { dispose: vi.fn(), sessionManager: { getSessionFile: () => "/sessions/child.jsonl" } } as any,
       aborted: false,
       steered: false,
     }) as any);
-    vi.mocked(resumeAgent).mockResolvedValue({ text: "fixed the findings" } as any);
     manager = new AgentManager();
   });
 
@@ -54,7 +55,6 @@ describe("a live workflow run keeps the records it may resume", () => {
     await manager.dispose();
     vi.useRealTimers();
     vi.mocked(runAgent).mockReset();
-    vi.mocked(resumeAgent).mockReset();
   });
 
   /** Spawn one child through a host and return the manager id it got. */
@@ -77,7 +77,8 @@ describe("a live workflow run keeps the records it may resume", () => {
 
     const resumed = await host.resumeAgent("wf-agent-0", "here are the review findings");
     expect(resumed).toMatchObject({ ok: true, text: "fixed the findings" });
-    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runAgent).mock.calls[1][3]).toMatchObject({ resumeSessionFile: "/sessions/child.jsonl" });
 
     // Still held after the resume settles: the script may come back again.
     await vi.advanceTimersByTimeAsync(20 * MINUTE);

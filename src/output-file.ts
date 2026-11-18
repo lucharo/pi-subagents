@@ -5,10 +5,10 @@
  * matching Claude Code's task output file format.
  */
 
-import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, type AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
 
 /**
  * Project/global default for writing a subagent's `.output` transcript; a custom
@@ -58,6 +58,36 @@ export function sessionTaskDir(cwd: string, sessionId: string): string {
   const dir = join(root, encoded, sessionId, "tasks");
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/**
+ * A finished agent's conversation, read back from disk: its pi session file
+ * when it has one, else its `.output` transcript. For readers of an agent
+ * whose live session is gone — a workflow child's is shut down when it settles
+ * (#4). Undefined when neither can be read.
+ */
+export function readTranscriptMessages(
+  files: { sessionFile?: string; outputFile?: string },
+): AgentSession["messages"] | undefined {
+  if (files.sessionFile !== undefined && existsSync(files.sessionFile)) {
+    try {
+      return SessionManager.open(files.sessionFile).buildSessionContext().messages;
+    } catch { /* fall through to the transcript */ }
+  }
+  if (files.outputFile !== undefined && existsSync(files.outputFile)) {
+    try {
+      const messages: AgentSession["messages"] = [];
+      for (const line of readFileSync(files.outputFile, "utf-8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const message = JSON.parse(line)?.message;
+          if (message && typeof message === "object") messages.push(message);
+        } catch { /* a torn last line from a run cut short */ }
+      }
+      return messages;
+    } catch { /* unreadable */ }
+  }
+  return undefined;
 }
 
 /** Create the output file path, ensuring the directory exists. */
