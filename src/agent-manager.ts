@@ -15,7 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -278,6 +278,11 @@ interface SpawnOptions {
   structuredOutput?: CompiledSchema;
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
+  /**
+   * The commit the worktree is created from, instead of HEAD. Internal: set by
+   * `reopen` so a resumed isolated child starts from its own saved branch.
+   */
+  worktreeFrom?: string;
   /**
    * Working directory for the agent (absolute path). Default: parent session
    * cwd. The agent's tools operate here, but .pi config (extensions, skills,
@@ -923,7 +928,9 @@ export class AgentManager {
     // that omits the field can't stop a caller that never saw the schema.
     let worktreeCwd: string | undefined;
     if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
+      const wt = options.worktreeFrom === undefined
+        ? await createWorktree(pi, baseCwd, id)
+        : await createWorktree(pi, baseCwd, id, options.worktreeFrom);
       if (!wt) {
         releaseSlot();
         throw new Error(
@@ -988,6 +995,13 @@ export class AgentManager {
       cutLoose();
     });
     const touch = () => this.touchRun(id);
+    // This invocation's own worktree and controller. A stopped run can end late,
+    // after the record was resumed (`reopen`) into a newer invocation with a
+    // worktree of its own: the late ending must clean up only its own tree and
+    // write nothing over the newer one's outcome.
+    const ownWorktree = record.worktree;
+    const controller = record.abortController;
+    const superseded = () => record.abortController !== controller;
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -1133,19 +1147,19 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Clean up worktree if used
-        if (record.worktree) {
+        // Clean up worktree if used — this invocation's own, never a newer one's.
+        if (ownWorktree) {
           // The one moment the child's tree still exists and the child is done
           // writing to it. try/catch, not decoration: a hook that throws must
           // not leave the worktree behind.
           if (options.onBeforeWorktreeCleanup) {
             try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
+              await options.onBeforeWorktreeCleanup(ownWorktree.path);
             } catch { /* ignore — never block cleanup */ }
           }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch && !late()) {
+          const wtResult = await cleanupWorktree(pi, baseCwd, ownWorktree, options.description);
+          if (!superseded()) record.worktreeResult = wtResult;
+          if (wtResult.hasChanges && wtResult.branch && !late() && !superseded()) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -1183,11 +1197,11 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Best-effort worktree cleanup on error
-        if (record.worktree) {
+        // Best-effort worktree cleanup on error — this invocation's own.
+        if (ownWorktree) {
           try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
+            const wtResult = await cleanupWorktree(pi, baseCwd, ownWorktree, options.description);
+            if (!superseded()) record.worktreeResult = wtResult;
           } catch { /* ignore cleanup errors */ }
         }
 
@@ -1308,6 +1322,9 @@ export class AgentManager {
       options: {
         ...base.options,
         resumeSessionFile: record.sessionFile,
+        // An isolated child continues from the branch its last run's changes
+        // were saved to, so the work it remembers doing is in its tree.
+        worktreeFrom: record.worktreeResult?.hasChanges ? record.worktreeResult.branch : undefined,
         signal,
         invocation: record.invocation,
         // The first run's hooks belong to its own call: its spawn callbacks, its
@@ -1478,6 +1495,7 @@ export class AgentManager {
       if (
         options?.isBackground
         || record.sessionFile === undefined
+        || !existsSync(record.sessionFile)
         || !this.reopenArgs.has(id)
         || record.status === "running"
         || record.status === "queued"

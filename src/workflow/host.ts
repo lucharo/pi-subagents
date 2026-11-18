@@ -445,14 +445,21 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
         const known = manager.getRecord(id);
         // Its session was shut down when it settled, and there is no file to
         // reopen it from: say what would have made it resumable.
-        const unsaved = known !== undefined && known.session === undefined && known.sessionFile === undefined;
+        const released = known !== undefined && known.session === undefined;
+        const unsaved = released && known.sessionFile === undefined;
+        // Saved, but the file is gone: a `session_dir` inside the child's own
+        // worktree is removed with that worktree when the child settles.
+        const gone = released && known.sessionFile !== undefined && !existsSync(known.sessionFile);
         return {
           ok: false,
           error: unsaved
             ? `Agent ${id} finished and its conversation was not saved to disk, so it cannot be resumed. ` +
               "Resuming a finished workflow agent reopens its session file: set `persist_session: true` on its agent, " +
               "or turn the rememberAgents setting back on."
-            : `Agent ${id} has no session to resume.`,
+            : gone
+              ? `Agent ${id} finished and its session file is gone (${known.sessionFile}), so it cannot be resumed. ` +
+                "Keep its session_dir outside the agent's worktree."
+              : `Agent ${id} has no session to resume.`,
         };
       }
       try { deps.onChildSettled?.(id); } catch { /* observers never break a run */ }

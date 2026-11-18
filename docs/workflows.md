@@ -252,7 +252,7 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
 
-A finished child keeps only its record: result, usage, timings, and the paths of its session file and `.output` transcript. Its session is shut down when it settles, so a run of hundreds of agents does not keep hundreds of sessions, and their extensions, alive. `resume` reopens that session file, so it needs one: an agent with `persist_session: false`, or run with the `rememberAgents` setting off, cannot be resumed once it has finished, and the call says so. An isolated child resumes in a fresh worktree, since its first one was committed to a branch and removed.
+A finished child keeps only its record: result, usage, timings, and the paths of its session file and `.output` transcript. Its session is shut down when it settles, so a run of hundreds of agents does not keep hundreds of sessions, and their extensions, alive. `resume` reopens that session file, so it needs one: an agent with `persist_session: false`, or run with the `rememberAgents` setting off, cannot be resumed once it has finished, and the call says so. An isolated child resumes in a fresh worktree made from the branch its changes were saved to, since its first one was removed when it settled. Keep an isolated agent's `session_dir` outside its worktree, or the session file goes with it.
 
 ### `pipeline()` and `parallel()`
 

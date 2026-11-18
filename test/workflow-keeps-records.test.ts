@@ -9,6 +9,9 @@
 // agent-manager-gc.test.ts: the constructor starts the cleanup interval, and
 // advancing the timers moves Date.now() along with it.
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -24,6 +27,9 @@ import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { ctx } from "./helpers/boot-extension.js";
 
 const MINUTE = 60_000;
+/** A real file: a resume reopens it, and refuses one that is gone. */
+const SESSION_FILE = join(mkdtempSync(join(tmpdir(), "keeps-records-")), "child.jsonl");
+writeFileSync(SESSION_FILE, "");
 const mockPi = {} as any;
 
 const spawnRequest = (agentId: string): WorkflowSpawnRequest => ({
@@ -44,7 +50,7 @@ describe("a live workflow run keeps the records it may resume", () => {
     // reopens its session file: the second `runAgent` call is the resume.
     vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => ({
       responseText: opts.resumeSessionFile ? "fixed the findings" : "done",
-      session: { dispose: vi.fn(), sessionManager: { getSessionFile: () => "/sessions/child.jsonl" } } as any,
+      session: { dispose: vi.fn(), sessionManager: { getSessionFile: () => SESSION_FILE } } as any,
       aborted: false,
       steered: false,
     }) as any);
@@ -78,7 +84,7 @@ describe("a live workflow run keeps the records it may resume", () => {
     const resumed = await host.resumeAgent("wf-agent-0", "here are the review findings");
     expect(resumed).toMatchObject({ ok: true, text: "fixed the findings" });
     expect(runAgent).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(runAgent).mock.calls[1][3]).toMatchObject({ resumeSessionFile: "/sessions/child.jsonl" });
+    expect(vi.mocked(runAgent).mock.calls[1][3]).toMatchObject({ resumeSessionFile: SESSION_FILE });
 
     // Still held after the resume settles: the script may come back again.
     await vi.advanceTimersByTimeAsync(20 * MINUTE);

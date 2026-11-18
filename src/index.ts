@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
@@ -715,6 +715,9 @@ export default function (pi: ExtensionAPI) {
     // Bypasses handle allocation, so a forged value would duplicate a live
     // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
     delete safeOptions.reclaim;
+    // Names a git ref to copy the worktree from: only `reopen` sets it, from a
+    // branch this extension created. A forged one would reach git as an argument.
+    delete safeOptions.worktreeFrom;
     // Every spawn through here is DETACHED — the caller gets an id back and
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
@@ -3392,6 +3395,48 @@ Terse command-style prompts produce shallow, generic work.
     await showRunningAgents(ctx);
   }
 
+  /**
+   * A conversation source for the viewer that follows the record rather than one session: the live session while
+   * there is one, the transcript on disk while there is none, re-subscribing when the record's session changes.
+   */
+  function followRecordConversation(
+    record: AgentRecord,
+    transcript: AgentSession["messages"] | undefined,
+  ): Pick<AgentSession, "messages" | "subscribe"> {
+    let cached = transcript;
+    return {
+      get messages() {
+        if (record.session) {
+          cached = undefined;
+          return record.session.messages;
+        }
+        cached ??= readTranscriptMessages(record) ?? [];
+        return cached;
+      },
+      subscribe(listener) {
+        let current: AgentSession | undefined;
+        let off: (() => void) | undefined;
+        current = record.session;
+        if (current) off = current.subscribe(listener);
+        const timer = setInterval(() => {
+          if (record.session === current) return;
+          off?.();
+          off = undefined;
+          current = record.session;
+          if (current) off = current.subscribe(listener);
+          // The source changed either way: repaint from it.
+          listener({ type: "agent_end", messages: [] } as never);
+        }, 500);
+        timer.unref?.();
+        return () => {
+          clearInterval(timer);
+          off?.();
+          current = undefined;
+        };
+      },
+    };
+  }
+
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
     // A settled workflow child has no live session (#4): show its conversation read back from disk, with no
     // stop or steer, since there is nothing running to reach.
@@ -3404,7 +3449,12 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     const { ConversationViewer, VIEWPORT_HEIGHT_PCT } = await import("./ui/conversation-viewer.js");
-    const session = record.session ?? { messages: settled ?? [], subscribe: () => () => {} };
+    // A workflow child's session comes and goes while the viewer is open: shut down when it settles, reopened by a
+    // resume. Follow whichever the record holds, so the viewer neither shows a superseded invocation nor pins a
+    // disposed session.
+    const session = record.workflowId !== undefined
+      ? followRecordConversation(record, settled)
+      : record.session ?? { messages: settled ?? [], subscribe: () => () => {} };
     const live = record.session !== undefined;
     const activity = agentActivity.get(record.id);
 

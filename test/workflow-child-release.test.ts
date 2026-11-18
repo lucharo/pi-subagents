@@ -5,7 +5,15 @@
 // session shut down and keeps only its record; a later `agent({ resume })`
 // reopens its session file.
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../src/worktree.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/worktree.js")>("../src/worktree.js");
+  return { ...actual, createWorktree: vi.fn(), cleanupWorktree: vi.fn() };
+});
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -19,16 +27,22 @@ import subagentsExtension from "../src/index.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { workflowHandoff } from "../src/workflow/task.js";
+import { cleanupWorktree, createWorktree } from "../src/worktree.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 const mockPi = {} as any;
+
+/** A real session file: a resume reopens it, and refuses one that is gone. */
+const SESSION_DIR = mkdtempSync(join(tmpdir(), "child-release-"));
+const SESSION_FILE = join(SESSION_DIR, "child.jsonl");
+writeFileSync(SESSION_FILE, "");
 
 /**
  * A child session as `runAgent` leaves it: extensions bound (a runner that
  * handles `session_shutdown`), a session file, and real listener bookkeeping,
  * so a test can see whether anything is still subscribed to it.
  */
-function childSession(sessionFile: string | null = "/sessions/child.jsonl") {
+function childSession(sessionFile: string | null = SESSION_FILE) {
   const listeners = new Set<(event: unknown) => void>();
   const session = {
     listeners,
@@ -100,6 +114,8 @@ describe("a settled workflow child keeps its record, not its session (#4)", () =
   afterEach(async () => {
     await manager.dispose();
     vi.mocked(runAgent).mockReset();
+    vi.mocked(createWorktree).mockReset();
+    vi.mocked(cleanupWorktree).mockReset();
   });
 
   it("shuts the session down when the child settles, and keeps its result, usage and files", async () => {
@@ -119,7 +135,7 @@ describe("a settled workflow child keeps its record, not its session (#4)", () =
     expect(record).toMatchObject({
       status: "completed",
       result: "done: scan the routes",
-      sessionFile: "/sessions/child.jsonl",
+      sessionFile: SESSION_FILE,
       lifetimeUsage: { input: 10, output: 5 },
     });
     expect(record.completedAt).toBeGreaterThanOrEqual(record.startedAt);
@@ -145,7 +161,7 @@ describe("a settled workflow child keeps its record, not its session (#4)", () =
 
     expect(resumed).toMatchObject({ ok: true, text: "continued: here are the findings" });
     expect(vi.mocked(runAgent).mock.calls[1][2]).toBe("here are the findings");
-    expect(vi.mocked(runAgent).mock.calls[1][3]).toMatchObject({ resumeSessionFile: "/sessions/child.jsonl", workflow: true });
+    expect(vi.mocked(runAgent).mock.calls[1][3]).toMatchObject({ resumeSessionFile: SESSION_FILE, workflow: true });
     // The caller re-attaches its transcript stream to the reopened session.
     expect(onChildResume).toHaveBeenCalledWith(id, sessions[1]);
     const record = manager.getRecord(id)!;
@@ -167,6 +183,65 @@ describe("a settled workflow child keeps its record, not its session (#4)", () =
     expect(resumed.ok).toBe(false);
     expect(resumed.ok === false && resumed.error).toMatch(/not saved to disk.*persist_session: true.*rememberAgents/s);
     expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("says so when a released child's session file has gone", async () => {
+    const missing = join(SESSION_DIR, "removed-with-its-worktree.jsonl");
+    mockRunAgent({ sessionFile: missing });
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    await host.spawnAgent(request("wf-agent-0"));
+
+    const resumed = await host.resumeAgent("wf-agent-0", "continue");
+
+    expect(resumed.ok === false && resumed.error).toMatch(/session file is gone/);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes an isolated child in a worktree made from the branch its changes were saved to", async () => {
+    const tree = (path: string) => ({ path, branch: "pi-agent-x", baseSha: "base", workPath: path });
+    vi.mocked(createWorktree).mockResolvedValueOnce(tree("/wt/first")).mockResolvedValueOnce(tree("/wt/second"));
+    vi.mocked(cleanupWorktree).mockResolvedValue({ hasChanges: true, branch: "pi-agent-x" });
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    await host.spawnAgent({ ...request("wf-agent-0"), isolation: "worktree" });
+
+    await host.resumeAgent("wf-agent-0", "fix what the review found");
+
+    expect(vi.mocked(createWorktree).mock.calls[0][3]).toBeUndefined();
+    expect(vi.mocked(createWorktree).mock.calls[1][3]).toBe("pi-agent-x");
+    expect(vi.mocked(cleanupWorktree).mock.calls.map(c => c[2].path)).toEqual(["/wt/first", "/wt/second"]);
+  });
+
+  it("a stopped run that ends after its resume cleans up only its own worktree", async () => {
+    const tree = (path: string) => ({ path, branch: "pi-agent-x", baseSha: "base", workPath: path });
+    vi.mocked(createWorktree).mockResolvedValueOnce(tree("/wt/first")).mockResolvedValueOnce(tree("/wt/second"));
+    vi.mocked(cleanupWorktree).mockImplementation(async (_pi, _cwd, wt) => ({ hasChanges: true, branch: `saved-${wt.path}` }));
+    let endFirst!: () => void;
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, prompt: string, options: any) => {
+      const session = childSession();
+      sessions.push(session);
+      options.onSessionCreated?.(session);
+      // The first run ignores its stop until told to end; the resume ends at once.
+      if (!options.resumeSessionFile) await new Promise<void>(resolve => { endFirst = resolve; });
+      return { responseText: `done: ${prompt}`, session, aborted: false, steered: false } as any;
+    });
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    const first = host.spawnAgent({ ...request("wf-agent-0"), isolation: "worktree" });
+    await vi.waitFor(() => expect(sessions).toHaveLength(1));
+    const record = manager.listAgents()[0];
+    manager.abort(record.id);
+    // Past the stop's grace: settled from outside, so the script can resume it.
+    manager.reapStalled(Date.now() + 60_000);
+    await first;
+    // The stopped run left no saved branch, so the resume starts from HEAD.
+    await host.resumeAgent("wf-agent-0", "go on");
+    expect(record.worktreeResult).toEqual({ hasChanges: true, branch: "saved-/wt/second" });
+
+    endFirst();
+    await vi.waitFor(() => expect(cleanupWorktree).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(cleanupWorktree).mock.calls.map(c => c[2].path)).toEqual(["/wt/second", "/wt/first"]);
+    // The late ending wrote nothing over the newer invocation's outcome.
+    expect(record.worktreeResult).toEqual({ hasChanges: true, branch: "saved-/wt/second" });
   });
 
   it("releases a child the stall check settles from outside", async () => {

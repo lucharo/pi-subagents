@@ -86,13 +86,15 @@ export async function createWorktree(
   pi: ExtensionAPI,
   cwd: string,
   agentId: string,
+  /** Commit or branch to create the copy from. Default: HEAD. */
+  fromRef = "HEAD",
 ): Promise<WorktreeInfo | undefined> {
   // Verify we're in a git repo with at least one commit (HEAD must exist)
   let baseSha: string;
   let subdir: string;
   try {
     await git(pi, cwd, ["rev-parse", "--is-inside-work-tree"], 5000);
-    baseSha = await git(pi, cwd, ["rev-parse", "HEAD"], 5000);
+    baseSha = await git(pi, cwd, ["rev-parse", fromRef], 5000);
     // Where cwd sits inside the repo ("" at the root): the agent must work at
     // the same subdirectory inside the copy, or a monorepo-package cwd would
     // silently widen to the whole repo. realpath both sides — git emits
@@ -108,8 +110,8 @@ export async function createWorktree(
   const worktreePath = join(tmpdir(), `pi-agent-${agentId}-${suffix}`);
 
   try {
-    // Create detached worktree at HEAD
-    await git(pi, cwd, ["worktree", "add", "--detach", worktreePath, "HEAD"], 30000);
+    // Create a detached worktree at HEAD (or the requested ref)
+    await git(pi, cwd, ["worktree", "add", "--detach", worktreePath, fromRef], 30000);
     return { path: worktreePath, branch, baseSha, workPath: subdir ? join(worktreePath, subdir) : worktreePath };
   } catch {
     // If worktree creation fails, return undefined (agent runs in normal cwd)
