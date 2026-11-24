@@ -740,6 +740,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:stalled` | An agent stopped responding and was marked failed ([`staleAgentMinutes`](#persistent-settings)) — fired for every agent, nested and workflow children included | `id`, `type`, `description`, `error`, `workflowId` (workflow child), `parentAgentId` (nested child) |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
+| `harness-tools:replaces` | At extension load, and again on every `harness-tools:ask` — tells a harness model provider (Claude Code or Codex run as pi's model) that pi's `Agent` replaces the harness's own subagent tools, which it switches off while `Agent` is offered | `{ tool: "Agent", by: "pi-subagents", replaces: { "claude-code": [{ tools: ["Agent"], versions: ">=2.1.69" }, { tools: ["Task"], versions: "<2.1.69" }], codex: [{ tools: ["spawn_agent"] }] } }` (each entry applies to the harness versions its range allows) |
 
 The four agent-lifecycle events — `subagents:started`, `:completed`, `:failed`, `:compacted` — are emitted for **top-level agents only**. Nested subagents and a workflow's children emit nothing else; they report through the parent or workflow that owns them. `subagents:stalled` is the one exception, so whatever watches a run can tell one of its agents died.
 
