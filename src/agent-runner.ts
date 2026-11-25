@@ -619,6 +619,54 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+/** Event other extensions listen on to trim an inheriting child's resources. */
+export const CHILD_RESOURCES_EVENT = "subagents:child-resources";
+
+/**
+ * Payload of {@link CHILD_RESOURCES_EVENT}. Listeners mutate it in place:
+ * push extension names (matched as `exclude_extensions:` entries are) onto
+ * `excludeExtensions`, or set `skills` to `false` or a list.
+ */
+export interface ChildResourcesRequest {
+  type: string;
+  excludeExtensions: string[];
+  skills: true | string[] | false;
+}
+
+/**
+ * Ask listeners on the parent's `pi.events` which extensions and skills a child
+ * of `type` should leave out. `emit` runs listeners synchronously, so the
+ * payload holds their answer when it returns.
+ *
+ * Asked only for a child that inherits everything (`extensions: true` and no
+ * `exclude_extensions:`): an agent file that narrows its extensions itself wins,
+ * and the hook is not asked. Returns undefined when not asked or when no
+ * listener changed anything, so the child resolves exactly as before.
+ */
+export function askChildResources(
+  pi: { events?: { emit(channel: string, data: unknown): void } } | undefined,
+  type: string,
+  config: { extensions: true | string[] | false; excludeExtensions?: string[]; skills: true | string[] | false },
+): { excludeExtensions?: string[]; skills?: true | string[] | false } | undefined {
+  if (!pi?.events || config.extensions !== true || config.excludeExtensions?.length) return undefined;
+  const request: ChildResourcesRequest = { type, excludeExtensions: [], skills: config.skills };
+  try {
+    pi.events.emit(CHILD_RESOURCES_EVENT, request);
+  } catch {
+    return undefined; // a throwing listener must not stop the spawn
+  }
+  const excludes = Array.isArray(request.excludeExtensions)
+    ? [...new Set(request.excludeExtensions.filter((n): n is string => typeof n === "string" && n.length > 0))]
+    : [];
+  const s = request.skills;
+  // Skills follow the listener only when the agent inherits all of them.
+  const skills = config.skills === true && (s === false || (Array.isArray(s) && s.every((x) => typeof x === "string")))
+    ? s
+    : undefined;
+  if (excludes.length === 0 && skills === undefined) return undefined;
+  return { excludeExtensions: excludes.length ? excludes : undefined, skills };
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -644,12 +692,14 @@ export async function runAgent(
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
+  // Other extensions may trim what an inheriting child loads (see askChildResources).
+  const hooked = options.isolated ? undefined : askChildResources(options.pi, type, config);
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
   // isolation is an intentional override, not a misconfiguration.
-  const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
-  const skills = options.isolated ? false : config.skills;
+  const excludeExtensions = options.isolated ? undefined : (hooked?.excludeExtensions ?? config.excludeExtensions);
+  const skills = options.isolated ? false : (hooked?.skills ?? config.skills);
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
@@ -812,7 +862,9 @@ export async function runAgent(
   // Exclude typo check: compares against the PRE-filter discovered set (an excluded
   // name absent from the surviving set is the exclude working as intended). Also
   // flags path-like and "*" entries — excludes are plain names only.
-  if (hasExcludes && discoveredNames) {
+  // A listener's names cover extensions that may not be installed here; only the
+  // agent file's own excludes are typos worth flagging.
+  if (hasExcludes && discoveredNames && !hooked) {
     for (const name of excludeNames) {
       if (!discoveredNames.has(name)) {
         options.onToolActivity?.({

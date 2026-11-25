@@ -2230,6 +2230,48 @@ describe("agent-runner exclude_extensions", () => {
     ]);
   });
 
+  it("subagents:child-resources listener trims an inheriting child; an agent file's own excludes win", async () => {
+    const heard: Array<{ type: string }> = [];
+    const piWithListener = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel !== "subagents:child-resources") return;
+          heard.push({ type: data.type });
+          data.excludeExtensions.push("notify", "not-installed-here");
+        },
+      },
+    } as any;
+    withExtensions({
+      "/ext/notify.ts": ["notify_send"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    setupAgent({ extensions: true });
+    await runAgent(ctx, "general-purpose", "go", { pi: piWithListener, onToolActivity });
+    expect(heard).toEqual([{ type: "general-purpose" }]);
+    expect(lastToolsPassed()).not.toContain("notify_send");
+    expect(lastToolsPassed()).toContain("mcp_tool");
+    // A listener's name for an extension this machine lacks is not a typo.
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+
+    // An agent file that sets exclude_extensions: itself is not asked.
+    createAgentSession.mockClear();
+    defaultResourceLoaderCtor.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    withExtensions({
+      "/ext/notify.ts": ["notify_send"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    setupAgent({ extensions: true, excludeExtensions: ["mcp"] });
+    await runAgent(ctx, "general-purpose", "go", { pi: piWithListener });
+    expect(heard).toHaveLength(1);
+    expect(lastToolsPassed()).toContain("notify_send");
+    expect(lastToolsPassed()).not.toContain("mcp_tool");
+  });
+
   it("exclude matches case-insensitively", async () => {
     setupAgent({ extensions: true, excludeExtensions: ["MCP"] });
     withExtensions({ "/ext/mcp.ts": ["mcp_tool"] });
