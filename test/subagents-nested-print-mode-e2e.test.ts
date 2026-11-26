@@ -16,7 +16,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Context, ToolCall } from "@earendil-works/pi-ai";
+import { type Context, getCurrentTools, type ToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
@@ -47,7 +47,7 @@ function userPrompt(ctx: Context): string {
 }
 
 function tools(ctx: Context): string[] {
-  return (ctx.tools ?? []).map((tool) => tool.name);
+  return getCurrentTools(ctx.messages).map((tool) => tool.name);
 }
 
 function toolResults(ctx: Context, name: string): string[] {
@@ -183,6 +183,35 @@ describe("PR #164 nested agents through the real print-mode boundary", () => {
     expect(nestedToolsIn(observed.get("plain-child"))).toEqual([]);
   });
 
+  it("gives the built-in general-purpose agent the nested tools, and Explore none", async () => {
+    // Claude Code parity: general-purpose keeps Agent, Explore and Plan do not.
+    const observed = new Map<string, string[]>();
+    ({ run, cwd } = await runWithAgents(
+      {},
+      (ctx) => {
+        const route = userPrompt(ctx);
+        if (route === "gp-child" || route === "explore-child") {
+          observed.set(route, tools(ctx));
+          return `${route} done`;
+        }
+        const spawned = toolResults(ctx, "Agent").length;
+        if (spawned === 0) {
+          return agentCall({ subagent_type: "general-purpose", description: "gp", prompt: "gp-child", run_in_background: false });
+        }
+        if (spawned === 1) {
+          return agentCall({ subagent_type: "Explore", description: "explore", prompt: "explore-child", run_in_background: false });
+        }
+        return "both done";
+      },
+      { prompt: "root-builtins" },
+    ));
+
+    expect(run.responseText).toContain("both done");
+    expect(observed.get("gp-child")).toEqual(expect.arrayContaining(NESTED_TOOLS));
+    expect(observed.get("explore-child")).toBeDefined();
+    expect(nestedToolsIn(observed.get("explore-child"))).toEqual([]);
+  });
+
   it("strips nested tools at the depth cap instead of injecting always-failing ones", async () => {
     // Default maxSubagentDepth is 2: main(0) → level_one(1) → level_two(2).
     // #164 injects nested tools only while depth < max, so the agent at the cap
@@ -298,11 +327,105 @@ describe("PR #164 nested agents through the real print-mode boundary", () => {
     ).toBe(true);
   });
 
+  // A delegating child that starts background work of its own and answers at
+  // once used to end its run there: the manager stopped the grandchildren, and
+  // its answer reached the parent as "started", the work lost. Its run now
+  // stays open until they report, and its final answer is its reaction to them.
+  it("keeps a child's run open until its background children report, then lets it answer", async () => {
+    const calls = new Map<string, number>();
+    const seen = (ctx: Context, token: string) => JSON.stringify(ctx.messages).includes(token);
+    ({ run, cwd } = await runWithAgents(
+      {
+        fan_out: "allowed_subagents: worker\n",
+        worker: "",
+      },
+      async (ctx) => {
+        const route = userPrompt(ctx);
+        calls.set(route, (calls.get(route) ?? 0) + 1);
+        if (route === "worker-a" || route === "worker-b") {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return route === "worker-a" ? "NUMBER_A_17" : "NUMBER_B_42";
+        }
+        if (route === "fan-out-child") {
+          if (seen(ctx, "NUMBER_A_17") && seen(ctx, "NUMBER_B_42")) return "FAN_OUT_FINAL NUMBER_A_17 NUMBER_B_42";
+          if (toolResults(ctx, "Agent").length === 0) {
+            return [
+              agentCall({ subagent_type: "worker", description: "worker a", prompt: "worker-a", run_in_background: true }, { id: "spawn-a" }),
+              agentCall({ subagent_type: "worker", description: "worker b", prompt: "worker-b", run_in_background: true }, { id: "spawn-b" }),
+            ];
+          }
+          // The answer the live run gave: the children "running", handed in at once.
+          return "FAN_OUT_STARTED both running";
+        }
+        if (toolResults(ctx, "Agent").length === 0) {
+          return agentCall({ subagent_type: "fan_out", description: "fan out", prompt: "fan-out-child", run_in_background: false });
+        }
+        return lastToolResult(ctx, "Agent");
+      },
+      { prompt: "root-fan-out", maxModelCalls: 24 },
+    ));
+
+    expect(run.responseText).toContain("FAN_OUT_FINAL NUMBER_A_17 NUMBER_B_42");
+    expect(calls.get("worker-a")).toBe(1);
+    expect(calls.get("worker-b")).toBe(1);
+  });
+
+  it("does not hand a child a background result it already read", async () => {
+    let drainTurns: string[] = [];
+    ({ run, cwd } = await runWithAgents(
+      {
+        collector: "allowed_subagents: worker\n",
+        worker: "",
+      },
+      async (ctx) => {
+        const route = userPrompt(ctx);
+        if (route === "worker-read") return "READ_RESULT_5";
+        if (route === "worker-unread") {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return "UNREAD_RESULT_9";
+        }
+        if (route === "collector-child") {
+          const last = ctx.messages[ctx.messages.length - 1];
+          if (last.role === "user" && JSON.stringify(last.content).includes("you started finished")) {
+            drainTurns = [...drainTurns, JSON.stringify(last.content)];
+            return "COLLECTOR_FINAL";
+          }
+          const spawned = toolResults(ctx, "Agent");
+          if (spawned.length === 0) {
+            return [
+              agentCall({ subagent_type: "worker", description: "worker read", prompt: "worker-read", run_in_background: true }, { id: "spawn-read" }),
+              agentCall({ subagent_type: "worker", description: "worker unread", prompt: "worker-unread", run_in_background: true }, { id: "spawn-unread" }),
+            ];
+          }
+          if (toolResults(ctx, "get_subagent_result").length === 0) {
+            const id = spawned[0].match(/Agent ID: (\S+)/)?.[1];
+            if (!id) throw new Error(`No nested agent ID in: ${spawned[0]}`);
+            return toolCall("get_subagent_result", { agent_id: id, wait: true }, "get-read");
+          }
+          return "COLLECTOR_DONE_EARLY";
+        }
+        if (toolResults(ctx, "Agent").length === 0) {
+          return agentCall({ subagent_type: "collector", description: "collect", prompt: "collector-child", run_in_background: false });
+        }
+        return lastToolResult(ctx, "Agent");
+      },
+      { prompt: "root-collector", maxModelCalls: 24 },
+    ));
+
+    expect(run.responseText).toContain("COLLECTOR_FINAL");
+    // One drain turn, carrying only the result the child never read.
+    expect(drainTurns).toHaveLength(1);
+    expect(drainTurns[0]).toContain("UNREAD_RESULT_9");
+    expect(drainTurns[0]).not.toContain("READ_RESULT_5");
+  });
+
   it("keeps nested get and steer ownership-scoped to the calling parent", async () => {
     // #164 aborts nested children when their owner settles, so the owner must
     // stay running while a foreign peer probes the live nested record. Spawn
-    // both owner and probe as top-level background agents (hold:false so the
-    // root can continue); the nested tools themselves enforce ownership.
+    // both owner and probe as top-level background agents; the nested tools
+    // themselves enforce ownership. The root releases the owner once it has the
+    // probe's verdict: a headless root waits for its background agents before
+    // it settles, so holding the owner past that would never end.
     const probeResults: { get?: string; steer?: string } = {};
     let ownedChildBlocked = false;
     let releaseOwnedChild = () => {};
@@ -414,28 +537,21 @@ describe("PR #164 nested agents through the real print-mode boundary", () => {
               "await-probe",
             );
           }
+          // The probe has reported: the owner and its nested child can finish.
+          releaseOwnedChild();
+          releaseOwner();
           return lastToolResult(ctx, "get_subagent_result");
         },
         { prompt: "root-ownership", maxModelCalls: 32, hold: false },
       ));
 
-      await waitForChildReady(ownedChildReady, 5_000);
       expect(ownedChildBlocked).toBe(true);
       expect(run.manager).toBeDefined();
       const manager = run.manager;
       if (!manager) throw new Error("Print-mode manager was not published");
-      // Owner (and its nested child) are still live — root finished without hold.
-      expect(manager.hasRunning()).toBe(true);
+      // The headless root settled only after its background agents did.
+      expect(manager.hasRunning()).toBe(false);
       waitForAll = manager.waitForAll();
-      let waitTimer: ReturnType<typeof setTimeout> | undefined;
-      const waitState = await Promise.race([
-        waitForAll.then(() => "settled" as const),
-        new Promise<"pending">((resolve) => {
-          waitTimer = setTimeout(() => resolve("pending"), 50);
-        }),
-      ]);
-      if (waitTimer) clearTimeout(waitTimer);
-      expect(waitState).toBe("pending");
 
       expect(run.responseText).toContain("OWNERSHIP_PROBE_DONE");
       expect(probeResults.get).toBeDefined();
@@ -448,11 +564,7 @@ describe("PR #164 nested agents through the real print-mode boundary", () => {
       );
       expect(probeResults.get).not.toContain("OWNED_NESTED_RESULT");
       expect(probeResults.steer).not.toContain("Steering message sent");
-
-      releaseOwnedChild();
-      releaseOwner();
       await expect(waitForAll).resolves.toBeUndefined();
-      expect(manager.hasRunning()).toBe(false);
     } finally {
       releaseOwnedChild();
       releaseOwner();

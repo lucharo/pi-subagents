@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentCall,
   agentToolResults,
+  isSubagentContext,
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
@@ -72,7 +73,7 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
       cwd: projectDir(settings),
       live: false, // scripted on purpose: a real model may not emit both calls
       respond: async (context: Context) => {
-        const isParent = (context.tools ?? []).some(t => t.name === "Agent");
+        const isParent = !isSubagentContext(context);
         if (isParent) {
           const alreadySpawned = context.messages.some(
             m => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",

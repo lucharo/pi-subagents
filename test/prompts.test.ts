@@ -1,7 +1,7 @@
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt, hasSkillsCatalog, hideAllSkills, hideSkillsListedIn, removeSkillsCatalog, stripLackedToolLines } from "../src/prompts.js";
+import { buildAgentPrompt, hideAllSkills, inheritableParentPrompt, stripLackedToolLines } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -63,8 +63,18 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("<sub_agent_context>");
     expect(prompt).not.toContain("<inherited_system_prompt>");
     expect(prompt).not.toContain("READ-ONLY");
-    // Empty systemPrompt means no <agent_instructions> section
+    // Empty systemPrompt means no <agent_instructions> section, and no
+    // re-delegation line unless the runner says this agent can spawn.
     expect(prompt).not.toContain("<agent_instructions>");
+    expect(prompt).not.toContain("re-delegate");
+  });
+
+  it("adds Claude Code's re-delegation line when the agent can delegate", () => {
+    const config = getDefaultConfig("general-purpose");
+    const prompt = buildAgentPrompt(config, "/workspace", env, "Parent.", { delegationGuideline: true });
+    expect(prompt).toContain(
+      "You are already the dedicated agent for this task. Do the work directly — do not re-delegate your entire assignment to another single subagent.",
+    );
   });
 
   it("general-purpose without parent prompt falls back to generic base", () => {
@@ -489,96 +499,6 @@ describe("buildAgentPrompt", () => {
   });
 });
 
-describe("hasSkillsCatalog", () => {
-  const skill = (name: string) => ({
-    name,
-    description: `Use for ${name} <work>.`,
-    filePath: `/skills/${name}/SKILL.md`,
-    baseDir: `/skills/${name}`,
-    sourceInfo: {} as never,
-    disableModelInvocation: false,
-  });
-
-  it("finds the bare catalog the pinned pi's formatSkillsForPrompt appends", () => {
-    const catalog = formatSkillsForPrompt([skill("one"), skill("two")]);
-    expect(hasSkillsCatalog(`You are pi.${catalog}\nCurrent working directory: /w`)).toBe(true);
-  });
-
-  it("finds pi 1.x's <skills> section, which wraps the same formatter output", () => {
-    const catalog = formatSkillsForPrompt([skill("one")]).trim();
-    expect(hasSkillsCatalog(`pre\n\n<rules>\nx\n</rules>\n\n<skills>\n${catalog}\n</skills>\n\n<cwd>\n/w\n</cwd>`)).toBe(true);
-  });
-
-  it("ignores a <skills> block written in project instructions, and an empty prompt", () => {
-    expect(hasSkillsCatalog("<project_context>\n<skills>\n- use tdd\n</skills>\n</project_context>")).toBe(false);
-    expect(hasSkillsCatalog("")).toBe(false);
-    expect(hasSkillsCatalog(undefined)).toBe(false);
-  });
-});
-
-describe("hideSkillsListedIn", () => {
-  const skill = (name: string, filePath = `/skills/${name}/SKILL.md`) => ({
-    name,
-    description: `Use for ${name}.`,
-    filePath,
-    baseDir: filePath.replace(/\/SKILL\.md$/, ""),
-    sourceInfo: {} as never,
-    disableModelInvocation: false,
-  });
-
-  it("hides the skills the inherited catalog lists and keeps the child's own visible", () => {
-    const parent = `You are pi.${formatSkillsForPrompt([skill("one"), skill("a&b", "/skills/a&b/SKILL.md")])}`;
-    const childSkills = [skill("one"), skill("a&b", "/skills/a&b/SKILL.md"), skill("from-ext", "/ext/from-ext/SKILL.md")];
-    const out = hideSkillsListedIn(parent)({ skills: childSkills, diagnostics: [] });
-    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([
-      ["one", true],
-      ["a&b", true],
-      ["from-ext", false],
-    ]);
-    // pi renders only the child-only skill, so no entry appears twice
-    const rendered = formatSkillsForPrompt(out.skills);
-    expect(rendered).toContain("<name>from-ext</name>");
-    expect(rendered).not.toContain("<name>one</name>");
-    expect(childSkills[0].disableModelInvocation).toBe(false); // the loader's own list is not mutated
-  });
-
-  it("ignores a <location> quoted outside pi's catalog, such as an example in AGENTS.md", () => {
-    const agentsMd = "<project_context>\nExample: <skill><location>/ext/from-ext/SKILL.md</location></skill>\n</project_context>";
-    const parent = `You are pi.\n${agentsMd}${formatSkillsForPrompt([skill("one")])}`;
-    const out = hideSkillsListedIn(parent)({ skills: [skill("one"), skill("from-ext", "/ext/from-ext/SKILL.md")], diagnostics: [] });
-    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([
-      ["one", true],
-      ["from-ext", false],
-    ]);
-  });
-});
-
-describe("removeSkillsCatalog", () => {
-  const skill = (name: string) => ({
-    name,
-    description: `Use for ${name}.`,
-    filePath: `/skills/${name}/SKILL.md`,
-    baseDir: `/skills/${name}`,
-    sourceInfo: {} as never,
-    disableModelInvocation: false,
-  });
-
-  it("drops pi 1.x's whole <skills> section and leaves the sections around it", () => {
-    const catalog = formatSkillsForPrompt([skill("one")]).trim();
-    const prompt = `pre\n\n<rules>\n- x\n</rules>\n\n<skills>\n${catalog}\n</skills>\n\n<cwd>\n/w\n</cwd>`;
-    expect(removeSkillsCatalog(prompt)).toBe("pre\n\n<rules>\n- x\n</rules>\n\n<cwd>\n/w\n</cwd>");
-  });
-
-  it("drops the bare catalog pi 0.84 appends, and leaves a <skills> block from AGENTS.md", () => {
-    const own = "<project_context>\n<skills>\n- use tdd\n</skills>\n</project_context>";
-    const prompt = `You are pi.\n${own}${formatSkillsForPrompt([skill("one")])}\nCurrent working directory: /w`;
-    const out = removeSkillsCatalog(prompt);
-    expect(out).not.toContain("<available_skills>");
-    expect(out).toContain(own);
-    expect(out).toContain("Current working directory: /w");
-  });
-});
-
 describe("hideAllSkills", () => {
   it("keeps every skill loaded and marks each one hidden from the catalog", () => {
     const skills = [{ name: "a", disableModelInvocation: false }, { name: "b", disableModelInvocation: true }];
@@ -600,7 +520,7 @@ describe("stripLackedToolLines", () => {
     { name: "send_message", promptGuidelines: ["Shared by two tools"] },
   ];
 
-  it("pi 1.x: drops tool lines and rule bullets of parent tools the child lacks", () => {
+  it("drops tool lines and rule bullets of parent tools the child lacks", () => {
     const prompt = [
       "You are an expert coding assistant.",
       "",
@@ -654,23 +574,46 @@ describe("stripLackedToolLines", () => {
     ].join("\n"));
   });
 
-  it("pi 0.84: works on the Available tools and Guidelines lists", () => {
-    const prompt = "You are pi.\n\nAvailable tools:\n- read: Read files\n- plan: show plans\n\nIn addition…\n\nGuidelines:\n- Keep a plan for 3+ steps\n- Be concise in your responses\n\nPi documentation";
-    expect(stripLackedToolLines(prompt, parentTools, ["read"])).toBe(
-      "You are pi.\n\nAvailable tools:\n- read: Read files\n\nIn addition…\n\nGuidelines:\n- Be concise in your responses\n\nPi documentation",
-    );
-  });
-
-  it("leaves project context alone, even a <tools> block an AGENTS.md writes, in either rendering", () => {
+  it("leaves project context alone, even a <tools> block an AGENTS.md writes", () => {
     const own = "<project_context>\n<tools>\n- plan: how we plan here\n</tools>\n<rules>\n- Keep a plan for 3+ steps\n</rules>\n</project_context>";
-    const legacy = `You are pi.\n\nAvailable tools:\n- read: Read files\n- plan: show plans\n\nGuidelines:\n- Keep a plan for 3+ steps\n- Be concise in your responses\n\nPi documentation\n\n${own}`;
-    expect(stripLackedToolLines(legacy, parentTools, ["read"])).toBe(`You are pi.\n\nAvailable tools:\n- read: Read files\n\nGuidelines:\n- Be concise in your responses\n\nPi documentation\n\n${own}`);
     const tagged = `pre\n\n<tools>\n- read: Read files\n- plan: show plans\n</tools>\n\n${own}`;
     expect(stripLackedToolLines(tagged, parentTools, ["read"])).toBe(`pre\n\n<tools>\n- read: Read files\n</tools>\n\n${own}`);
+  });
+
+  it("trims pi's own lists, not a <tools> block appended after them (APPEND_SYSTEM.md)", () => {
+    const appended = "<tools>\n- plan: our own note about plans\n</tools>";
+    const prompt = `pre\n\n<tools>\n- read: Read files\n- plan: show plans\n</tools>\n\n<rules>\n- Keep a plan for 3+ steps\n- Be concise in your responses\n</rules>\n\n${appended}`;
+    expect(stripLackedToolLines(prompt, parentTools, ["read"])).toBe(
+      `pre\n\n<tools>\n- read: Read files\n</tools>\n\n<rules>\n- Be concise in your responses\n</rules>\n\n${appended}`,
+    );
   });
 
   it("changes nothing when the child has every parent tool", () => {
     const prompt = "<tools>\n- plan: show plans\n</tools>\n\n<rules>\n- Keep a plan for 3+ steps\n</rules>";
     expect(stripLackedToolLines(prompt, parentTools, parentTools.map((t) => t.name))).toBe(prompt);
+  });
+});
+
+describe("inheritableParentPrompt", () => {
+  const preamble = "You are pi.\n\n<project_context>\nRules.\n</project_context>";
+  const skills = "<skills>\n<available_skills>\n  <skill><name>a</name></skill>\n</available_skills>\n</skills>";
+
+  it("drops the skills, cwd and extension sections", () => {
+    const rendered = `${preamble}\n\n${skills}\n\n<cwd>\n/work\n</cwd>\n\n<extension_instructions>\nX\n</extension_instructions>`;
+    expect(inheritableParentPrompt(rendered, "/work")).toBe(preamble);
+  });
+
+  it("drops the cwd section when there are no skills", () => {
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\n/work\n</cwd>`, "/work")).toBe(preamble);
+  });
+
+  it("matches the cwd as pi renders it on Windows", () => {
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\nC:/work\n</cwd>`, "C:\\work")).toBe(preamble);
+  });
+
+  it("returns a prompt without the cwd section unchanged", () => {
+    const forced = `${preamble}\n\n${skills}`;
+    expect(inheritableParentPrompt(forced, "/work")).toBe(forced);
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\n/other\n</cwd>`, "/work")).toContain("/other");
   });
 });

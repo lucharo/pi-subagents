@@ -30,24 +30,24 @@
  *     settle, and the verdict travels back on the spawn result. `runGate` still
  *     exists for a child that had no worktree; the runtime uses whichever of
  *     the two happened, never both.
- *   - **how long a finished child stays resumable.** The manager drops finished
- *     records ten minutes after they settle, but a script may resume a child
- *     much later (fix, then a long review, then resume the fixer). So every
- *     child is held on the manager for as long as the run lives, and the
- *     caller hands the holds back with `release()` once the run settles. A
- *     hold keeps the record only: the manager shuts the child's session down
- *     when it settles, and a resume reopens it from its session file (#4).
+ *   - **how a finished child is resumed.** The manager shuts a workflow
+ *     child's session down when it settles and keeps its record (fork, #4); a
+ *     resume within the manager's ten minutes reopens the session file on that
+ *     record. After that the record is evicted and `reopenAgent` reopens the
+ *     saved session under the same id.
  */
 
 import { existsSync } from "node:fs";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
+import { reopenTarget, worktreeLost } from "../agent-record-entry.js";
+import type { ToolActivity } from "../agent-runner.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
-import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
+import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnRequest, WorkflowSpawnResult } from "./runtime.js";
 import { resolveWorkflowSource } from "./saved.js";
 
 /**
@@ -141,18 +141,44 @@ function resolvedInfo(record: AgentRecord | undefined) {
   };
 }
 
-function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
-  const tokens = getLifetimeTotal(record.lifetimeUsage);
-  // Reported separately from `tokens`, which is the lifetime total. The script's
-  // `budget` counts *output* tokens, as Claude Code's does — billing the input
-  // and cache reads a fan-out re-sends would over-report it by an order of
-  // magnitude and make the documented guards useless.
-  const outputTokens = record.lifetimeUsage?.output ?? 0;
+type InvocationUsage = Required<Pick<WorkflowSpawnResult, "tokens" | "outputTokens" | "toolCalls">>;
+
+/**
+ * This invocation's counters: the record's lifetime totals minus `baseline`,
+ * which a resume of a still-live record takes before it starts so the resumed
+ * row counts only its continuation.
+ */
+function usageSince(record: AgentRecord, baseline?: InvocationUsage): InvocationUsage {
+  return {
+    tokens: getLifetimeTotal(record.lifetimeUsage) - (baseline?.tokens ?? 0),
+    // Reported separately from `tokens`. The script's `budget` counts *output*
+    // tokens, as Claude Code's does — billing the input and cache reads a
+    // fan-out re-sends would over-report it by an order of magnitude and make
+    // the documented guards useless.
+    outputTokens: (record.lifetimeUsage?.output ?? 0) - (baseline?.outputTokens ?? 0),
+    toolCalls: record.toolUses - (baseline?.toolCalls ?? 0),
+  };
+}
+
+/**
+ * The manager hooks that forward a running child's counters to its row. Tools
+ * count on completion, and tokens on finalized `message_end` usage — never on
+ * streaming estimates.
+ */
+function progressHooks(report: () => void) {
+  return {
+    onToolActivity: (activity: ToolActivity) => { if (activity.type === "end") report(); },
+    onAssistantUsage: report,
+  };
+}
+
+function toSpawnResult(record: AgentRecord, baseline?: InvocationUsage): WorkflowSpawnResult {
+  const { tokens, outputTokens, toolCalls } = usageSince(record, baseline);
   const cwd = childCwd(record);
   const common = {
     ...(tokens > 0 ? { tokens } : {}),
     ...(outputTokens > 0 ? { outputTokens } : {}),
-    ...(record.toolUses > 0 ? { toolCalls: record.toolUses } : {}),
+    ...(toolCalls > 0 ? { toolCalls } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
   };
 
@@ -181,33 +207,28 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
 const GATE_SHELL: readonly [string, string] =
   process.platform === "win32" ? ["cmd", "/c"] : ["sh", "-c"];
 
-/** A host plus the one call its owner makes when the run is over. */
-export interface WorkflowHostHandle extends WorkflowHost {
-  /**
-   * Hand back every record this run held. Call once the run has settled, done,
-   * failed or stopped: from then on its children fall under the manager's
-   * normal ten-minute rule, counted from this moment.
-   */
-  release(): void;
-}
-
-/** Makes each host's hold owner unique, even across reruns of one workflow id. */
-let hostSequence = 0;
-
-export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandle {
+export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   const { pi, ctx, manager } = deps;
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
   /** Aborts asked for before the child had a manager id (a skip during startup): applied when it gets one. */
   const pendingAborts = new Set<string>();
-  /** Who holds this run's records on the manager — see `release()`. */
-  const holdOwner = `${deps.workflowId ?? "workflow"}#${++hostSequence}`;
   /**
-   * Set by `release()`. A stopped run can settle while a child is still in
-   * startup (creating its worktree): that child's spawn callback then fires
-   * after the release, and a hold taken then would never be handed back.
+   * Manager record id → what reopening that child needs once the manager has
+   * evicted it, ten minutes after it finished. A long review or a merge queue
+   * outlasts that easily, and `resume` must still reach the child (#385).
+   * Lives exactly as long as the run, like `records`, so memory stays bounded
+   * by the run itself; the manager keeps no tombstone for an owned child.
    */
-  let released = false;
+  const settled = new Map<string, Pick<AgentRecord, "type" | "description" | "sessionFile"> & { worktreeLost: boolean }>();
+  const remember = (record: AgentRecord): void => {
+    settled.set(record.id, {
+      type: record.type,
+      description: record.description,
+      sessionFile: record.sessionFile,
+      worktreeLost: worktreeLost(record),
+    });
+  };
   /**
    * scopeModels warnings already toasted, so a fan-out that pins one
    * out-of-scope agent file raises one notification rather than one per child.
@@ -247,6 +268,61 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       return { ok: false, output: output || `Gate command timed out: ${command}` };
     }
     return { ok: result.code === 0, output };
+  }
+
+  /**
+   * Resume a child the manager has evicted: reopen its saved session under the
+   * same id, still owned by this run, as `Agent({ resume })` does for a
+   * top-level agent. The continuation runs under the agent type's current
+   * definition, like every reopen — the script's model, schema and isolation
+   * for the first run are not replayed.
+   */
+  async function reopenAgent(
+    id: string,
+    prompt: string,
+    onResolved: WorkflowSpawnRequest["onResolved"],
+    onProgress: WorkflowSpawnRequest["onProgress"],
+  ): Promise<WorkflowSpawnResult> {
+    const kept = settled.get(id);
+    if (kept === undefined) return { ok: false, error: `Agent ${id} cannot be resumed — it never finished a run to resume from.` };
+    const reopen = reopenTarget(kept.type, kept.sessionFile, kept.worktreeLost);
+    if (!reopen.ok) return { ok: false, error: `Agent ${id} cannot be resumed — ${reopen.reason}.` };
+    const config = getAgentConfig(reopen.type);
+    // A reclaimed record starts from zero, so its lifetime totals already are
+    // this continuation's — no baseline, unlike a resume of a live record.
+    const reportProgress = () => {
+      const record = manager.getRecord(id);
+      if (record !== undefined) onProgress?.(usageSince(record));
+    };
+    try {
+      const { record } = await manager.spawnAndWait(
+        pi,
+        ctx,
+        reopen.type,
+        prompt,
+        {
+          description: kept.description,
+          resumeSessionFile: reopen.sessionFile,
+          reclaim: { id },
+          ...(config?.isolated !== undefined ? { isolated: config.isolated } : {}),
+          ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
+          ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+          ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
+          ...progressHooks(reportProgress),
+          // The snapshot re-attaches the reopened child's transcript (fork).
+          onSessionCreated: (session: AgentSession) => {
+            try { deps.onChildResume?.(id, session); } catch { /* observers never break a run */ }
+          },
+        },
+        () => { onResolved?.({ recordId: id }); reportProgress(); },
+      );
+      remember(record);
+      const info = resolvedInfo(record);
+      if (info !== undefined) onResolved?.(info);
+      return toSpawnResult(record);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   return {
@@ -325,6 +401,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
         const info = resolvedInfo(manager.getRecord(spawnedId));
         if (info !== undefined) request.onResolved?.(info);
       };
+      const reportProgress = () => {
+        const record = spawnedId === undefined ? undefined : manager.getRecord(spawnedId);
+        if (record !== undefined) request.onProgress?.(usageSince(record));
+      };
       const command = request.gate;
       /**
        * Verify the child's work while its worktree still exists.
@@ -355,6 +435,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
           request.prompt,
           {
             description: request.label,
+            // Same as the Agent tool: `isolated` comes off the agent definition.
+            // Left out, a hermetic agent's script-spawned children loaded every
+            // host extension and picked up its MCP and web tools.
+            ...(config?.isolated !== undefined ? { isolated: config.isolated } : {}),
             // The stamp is what keeps this child out of the session's
             // `maxConcurrent` pool — see `occupiesPoolSlot`. The run already
             // bounds how many of its agents run at once, and counting them
@@ -390,7 +474,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
                 try { deps.onChildSession?.(spawnedId, session, request.prompt); } catch { /* observers never break a run */ }
               }
             },
+            ...progressHooks(reportProgress),
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
+            ...(request.disallowedTools !== undefined ? { disallowedTools: request.disallowedTools } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
@@ -400,9 +486,6 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
             spawnedId = id;
             records.set(request.agentId, id);
             if (pendingAborts.delete(request.agentId)) manager.abort(id);
-            // Held from the moment it exists, so `resume` can still reach it
-            // however long the script takes to come back to it.
-            if (!released) manager.hold(id, holdOwner);
             // Ahead of `reportResolved`, and not folded into it: that one waits
             // for the child's session so it can name the effective model, while
             // the record id is known here and is what the inspector opens a
@@ -410,8 +493,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
             // would otherwise never be openable at all.
             request.onResolved?.({ recordId: id });
             reportResolved();
+            // Counters a stub reported synchronously, before the id existed.
+            reportProgress();
           },
         );
+        remember(record);
         try { deps.onChildSettled?.(record.id); } catch { /* observers never break a run */ }
         return { ...toSpawnResult(record), ...(gate !== undefined ? { gate } : {}) };
       } catch (error) {
@@ -431,21 +517,32 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       else pendingAborts.add(agentId);
     },
 
-    async resumeAgent(agentId, prompt, onResolved) {
+    async resumeAgent(agentId, prompt, onResolved, onProgress) {
       const id = records.get(agentId);
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
+      // A live record carries the earlier runs' totals; the resumed row counts
+      // only what this continuation adds.
+      const previous = manager.getRecord(id);
+      const baseline = previous === undefined ? undefined : usageSince(previous);
       const record = await manager.resume(id, prompt, deps.signal, {
+        ...progressHooks(() => {
+          const current = manager.getRecord(id);
+          if (current !== undefined) onProgress?.(usageSince(current, baseline));
+        }),
         onSession: session => {
           try { deps.onChildResume?.(id, session); } catch { /* observers never break a run */ }
         },
       });
       if (record === undefined) {
         const known = manager.getRecord(id);
-        // Its session was shut down when it settled, and there is no file to
-        // reopen it from: say what would have made it resumable.
-        const released = known !== undefined && known.session === undefined;
+        // Evicted from memory (or never had a session): reopen it from its saved
+        // session, or say why not.
+        if (known === undefined) return reopenAgent(id, prompt, onResolved, onProgress);
+        // Still in memory, its session shut down when it settled (fork, #14), and
+        // the manager could not reopen it: say what would have made it resumable.
+        const released = known.session === undefined;
         const unsaved = released && known.sessionFile === undefined;
         // Saved, but the file is gone: a `session_dir` inside the child's own
         // worktree is removed with that worktree when the child settles.
@@ -471,7 +568,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       onResolved?.({ recordId: id });
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record);
+      return toSpawnResult(record, baseline);
     },
 
     /**
@@ -488,11 +585,6 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       // The child's worktree when it had one and it survived; otherwise the
       // session's own directory, which is where a non-isolated child worked.
       return await executeGate(command, gate.cwd ?? ctx.cwd);
-    },
-
-    release() {
-      released = true;
-      manager.releaseAll(holdOwner);
     },
   };
 }

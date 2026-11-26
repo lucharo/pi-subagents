@@ -5,8 +5,8 @@
  * Subscribes to session events for real-time streaming updates.
  */
 
-import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type AgentSession, getMarkdownTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { type Component, type Focusable, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type OverlayOptions, ScrollView, type ScrollViewScrollbar, stripTerminalSequences, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
@@ -15,11 +15,59 @@ import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
+/** An assistant message's tool call, and the message that answers it. */
+type AgentMessage = AgentSession["messages"][number];
+type ToolCallPart = Extract<Extract<AgentMessage, { role: "assistant" }>["content"][number], { type: "toolCall" }>;
+type ToolResultPart = Extract<AgentMessage, { role: "toolResult" }>;
+
+/** A rendered tool call, reused across renders so its component's caches survive. */
+interface ToolBlock {
+  component: ToolExecutionComponent;
+  /** The result already handed to the component, if any. */
+  result?: ToolResultPart;
+  /**
+   * The block's rendered rows and the width they were produced at.
+   *
+   * `ToolExecutionComponent` re-wraps and re-paints its whole subtree on every
+   * `render()`, which costs ~0.4 ms per settled call — enough that a 500-message
+   * transcript re-wrapped every block on every keystroke. The rows only change
+   * when the inputs above do, so they are kept and reused until one does.
+   */
+  rows?: readonly string[];
+  width?: number;
+}
+
+/**
+ * Whether pi's global theme is initialized.
+ *
+ * `ToolExecutionComponent` draws with pi's theme rather than the instance this
+ * viewer is handed, and pi throws on the first color lookup when nothing called
+ * `initTheme()`. This viewer is constructed outside pi too — its own unit tests,
+ * an embedded session — so the tool path is gated on a probe, the same way
+ * `resolveMarkdownTheme` already treats pi's Markdown theme.
+ */
+function piThemeAvailable(): boolean {
+  try {
+    getMarkdownTheme().heading("probe");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
 const CHROME_LINES_BASE = 6;
 const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
+const SCROLLBAR_WIDTH = 1;
+
+/** Follow the active renderer, not a setting that may require a restart. */
+export function getConversationOverlayOptions(tui: Pick<TUI, "mode">): OverlayOptions {
+  return tui.mode === "fullscreen"
+    ? { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 }
+    : { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` };
+}
 
 /**
  * Cap on a single tool result or bash output before the viewer elides the rest.
@@ -33,6 +81,12 @@ export const VIEWPORT_HEIGHT_PCT = 70;
  * most real results mid-sentence.
  */
 export const RESULT_MAX_CHARS = 16_000;
+
+/** The `b` affordance: whether this run can be handed to the background now, and the handoff. */
+export interface ViewerBackgroundAction {
+  available(): boolean;
+  send(): void;
+}
 
 /** Cycle order for the viewer's `m` key. */
 const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
@@ -137,9 +191,24 @@ function truncationNote(elided: number): string {
   return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
 }
 
-export class ConversationViewer implements Component {
+/**
+ * What the viewer reads off a session. A settled workflow child's conversation read back from
+ * disk (fork, #4) has only the messages; a live session has the rest too.
+ */
+export type ViewerSession = Pick<AgentSession, "messages" | "subscribe">
+  & Partial<Pick<AgentSession, "extensionRunner" | "getToolDefinition" | "sessionManager">>;
+
+export class ConversationViewer implements Component, Focusable {
   private scrollOffset = 0;
   private autoScroll = true;
+  focused = false;
+  private readonly fullscreen: boolean;
+  private viewport: { width: number; top: number; height: number; maxScroll: number; thumbTop: number; thumbHeight: number } | undefined;
+  private scrollbarGrabOffset: number | undefined;
+  private footerTargets: { start: number; end: number; key: string }[] = [];
+  private latestTarget: { row: number; start: number; end: number } | undefined;
+  private newMessages = 0;
+  private readonly scrollView: ScrollView;
   private unsubscribe: (() => void) | undefined;
   private lastInnerW = 0;
   private closed = false;
@@ -159,11 +228,20 @@ export class ConversationViewer implements Component {
    * Weak so a compacted-away message doesn't pin its render.
    */
   private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
+  /** One block per tool call id, so a redraw reuses the component's own caches. */
+  private readonly toolBlocks = new Map<string, ToolBlock>();
+  /**
+   * Whether calls render through pi's components. Probe-gated: without pi's
+   * theme the viewer keeps its own plain rendering rather than throwing.
+   */
+  private readonly toolRendering = piThemeAvailable();
+  /** Whether tool blocks show their full output; toggled with pi's expand key. */
+  private toolsExpanded = false;
 
   constructor(
     private tui: TUI,
     /** A live session, or a settled agent's conversation read back from disk (no events). */
-    private session: Pick<AgentSession, "messages" | "subscribe">,
+    private session: ViewerSession,
     private record: AgentRecord,
     private activity: AgentActivity | undefined,
     private theme: Theme,
@@ -191,16 +269,37 @@ export class ConversationViewer implements Component {
      * the same thing. Omitted → `m` still cycles, viewer-locally.
      */
     private onMarkdownMode?: (mode: ViewerMarkdownMode) => void,
+    /** Pi's fullscreen scrollbar preference, captured when the observer opens. */
+    scrollbarMode: ScrollViewScrollbar = "auto",
+    /**
+     * Hand this run to the background. `available` is read live — it turns
+     * false the instant the handoff lands or the run ends. Omitted → no `b`
+     * affordance (history views).
+     */
+    private onBackground?: ViewerBackgroundAction,
   ) {
+    this.fullscreen = tui.mode === "fullscreen";
     this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
-    this.unsubscribe = session.subscribe(() => {
+    this.scrollView = new ScrollView({
+      render: width => this.buildContentLines(width),
+      invalidate: () => {},
+    }, { follow: "end", scrollbar: this.fullscreen ? scrollbarMode : "hidden" });
+    this.unsubscribe = session.subscribe(event => {
       if (this.closed) return;
+      if (this.fullscreen && !this.scrollView.isFollowingEnd && event.type === "message_start" && ["user", "assistant", "toolResult", "bashExecution"].includes(event.message.role)) {
+        this.newMessages++;
+      }
       this.tui.requestRender();
     });
   }
 
   handleInput(data: string): void {
+    if (this.closed) return;
+    if (this.fullscreen && (this.keys.bottom(data) || (!this.composer && matchesKey(data, "end")))) {
+      this.jumpToLatest();
+      return;
+    }
     // While composing a steer message, the input owns all keys (Enter sends,
     // Esc cancels — both wired in openComposer()). Editing keys flow through.
     if (this.composer) {
@@ -221,6 +320,16 @@ export class ConversationViewer implements Component {
     if (matchesKey(data, "enter") && this.canSteer()) {
       this.stopArmed = false;
       this.openComposer();
+      return;
+    }
+
+    // Hand a live foreground run to the background. Single press, unlike stop:
+    // the transition is one-way but keeps the agent working, so a stray key
+    // costs a notification rather than the run.
+    if (matchesKey(data, "b") && this.canSendToBackground()) {
+      this.stopArmed = false;
+      this.onBackground?.send();
+      this.tui.requestRender();
       return;
     }
 
@@ -252,8 +361,31 @@ export class ConversationViewer implements Component {
     }
     if (this.stopArmed) this.stopArmed = false;
 
+    // Unfold tool output — the same key, and the same meaning, as in the main
+    // transcript. It is what the renderers' own elision notices refer to.
+    if (this.keys.expand(data)) {
+      this.toolsExpanded = !this.toolsExpanded;
+      for (const block of this.toolBlocks.values()) {
+        block.component.setExpanded(this.toolsExpanded);
+        block.rows = undefined;
+      }
+      this.tui.requestRender();
+      return;
+    }
+
     const totalLines = this.buildContentLines(this.lastInnerW).length;
     const viewportHeight = this.viewportHeight();
+    if (this.fullscreen) {
+      this.scrollView.updateLayout(totalLines, viewportHeight, () => {
+        if (!this.closed) this.tui.requestRender();
+      });
+      if (this.keys.scrollUp(data)) this.scrollView.scrollBy(-1);
+      else if (this.keys.scrollDown(data)) this.scrollView.scrollBy(1);
+      else if (this.keys.pageUp(data)) this.scrollView.scrollBy(-viewportHeight);
+      else if (this.keys.pageDown(data)) this.scrollView.scrollBy(viewportHeight);
+      else if (this.keys.top(data) || matchesKey(data, "home")) this.scrollView.scrollToStart();
+      return;
+    }
     const maxScroll = Math.max(0, totalLines - viewportHeight);
 
     if (this.keys.scrollUp(data)) {
@@ -268,34 +400,114 @@ export class ConversationViewer implements Component {
     } else if (this.keys.pageDown(data)) {
       this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
       this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (matchesKey(data, "home")) {
+    } else if (this.keys.top(data) || matchesKey(data, "home")) {
       this.scrollOffset = 0;
       this.autoScroll = false;
-    } else if (matchesKey(data, "end")) {
+    } else if (this.keys.bottom(data) || matchesKey(data, "end")) {
       this.scrollOffset = maxScroll;
       this.autoScroll = true;
     }
   }
 
+  private jumpToLatest(): void {
+    this.scrollView.scrollToEnd();
+    this.newMessages = 0;
+    this.stopArmed = false;
+    this.tui.requestRender();
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult {
+    if (!this.fullscreen) return { handled: false };
+    // Every cell belongs to this observer. Even unused clicks/drags must not
+    // fall through to Pi's transcript selection, scrolling, or editor.
+    if (this.closed || !this.viewport) return { handled: true, render: false };
+    const view = this.viewport;
+    const onScrollbar = this.scrollView.scrollbar !== "hidden" && event.x >= view.width - SCROLLBAR_WIDTH && event.x < view.width && event.y >= view.top && event.y < view.top + view.height;
+    if (event.type === "move") {
+      this.scrollView.setScrollbarActive(onScrollbar);
+      return { handled: true, render: false };
+    }
+    if (event.type === "wheel") {
+      this.stopArmed = false;
+      this.scrollView.scrollBy(event.wheelDelta ?? 0);
+      return { handled: true, render: true };
+    }
+    if (event.type === "release") {
+      const wasDragging = this.scrollbarGrabOffset !== undefined;
+      this.scrollbarGrabOffset = undefined;
+      this.scrollView.setScrollbarActive(onScrollbar);
+      return { handled: true, render: wasDragging };
+    }
+    if (event.type === "drag" && this.scrollbarGrabOffset !== undefined) {
+      const travel = view.height - view.thumbHeight;
+      const position = Math.max(0, Math.min(travel, event.y - view.top - this.scrollbarGrabOffset));
+      this.scrollView.scrollTo(travel > 0 ? Math.round(position / travel * view.maxScroll) : 0);
+      return { handled: true, render: true };
+    }
+    if (event.type === "press" && event.button === "left") {
+      this.scrollbarGrabOffset = undefined;
+      this.scrollView.setScrollbarActive(onScrollbar);
+      if (this.latestTarget && event.y === this.latestTarget.row && event.x >= this.latestTarget.start && event.x < this.latestTarget.end) {
+        this.jumpToLatest();
+        return { handled: true, render: true };
+      }
+      if (event.y === this.tui.terminal.rows - 1) {
+        const target = this.footerTargets.find(t => event.x >= t.start && event.x < t.end);
+        if (target) {
+          this.handleInput(target.key);
+          return { handled: true, render: true };
+        }
+      }
+      this.stopArmed = false;
+      if (this.composer && event.y === this.tui.terminal.rows - 2) {
+        this.composer.handleMouse({ ...event, x: event.x - 1, y: 0, width: this.lastInnerW, height: 1 });
+        return { handled: true, render: true };
+      }
+      if (onScrollbar && view.maxScroll > 0) {
+        const y = event.y - view.top;
+        if (y >= view.thumbTop && y < view.thumbTop + view.thumbHeight) {
+          this.scrollbarGrabOffset = y - view.thumbTop;
+          return { handled: true, capture: true, render: true };
+        }
+        this.scrollView.scrollBy(y < view.thumbTop ? -view.height : view.height);
+        // A track click still pages, but holding it can grab the thumb too.
+        this.scrollbarGrabOffset = Math.floor(view.thumbHeight / 2);
+        return { handled: true, capture: true, render: true };
+      }
+      return { handled: true, render: true };
+    }
+    return { handled: true, render: false };
+  }
+
   render(width: number): string[] {
-    if (width < 6) return []; // too narrow for any meaningful rendering
+    this.footerTargets = [];
+    this.latestTarget = undefined;
+    this.viewport = undefined;
+    const rows = Math.max(0, this.tui.terminal.rows);
+    if (!this.fullscreen && width < 6) return []; // too narrow for any meaningful rendering
+    if (width <= SCROLLBAR_WIDTH + 1) return Array.from({ length: rows }, () => " ".repeat(Math.max(0, width)));
     const th = this.theme;
-    const innerW = width - 4; // border + padding
+    const innerW = this.fullscreen ? this.scrollView.getContentWidth(width - 1) : width - 4;
     this.lastInnerW = innerW;
     const lines: string[] = [];
-
+    const footerActions: { label: string; key: string }[] = [];
     const pad = (s: string, len: number) => {
       const vis = visibleWidth(s);
       return s + " ".repeat(Math.max(0, len - vis));
     };
-    const row = (content: string) =>
-      th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
+    const row = (content: string, scrollbar?: string): string => {
+      if (this.fullscreen) {
+        const contentWidth = width - 1 - (scrollbar ? SCROLLBAR_WIDTH : 0);
+        return " " + truncateToWidth(content, contentWidth, scrollbar ? "" : "...", true) + (scrollbar ?? "");
+      }
+      return th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
+    };
     const hrTop = th.fg("border", `╭${"─".repeat(width - 2)}╮`);
     const hrBot = th.fg("border", `╰${"─".repeat(width - 2)}╯`);
     const hrMid = row(th.fg("dim", "─".repeat(innerW)));
 
     // Header
-    lines.push(hrTop);
+    if (!this.fullscreen) lines.push(hrTop);
     const modeLabel = getPromptModeLabel(this.record.type);
     const modeTag = modeLabel ? ` ${th.fg("dim", `(${modeLabel})`)}` : "";
     const statusIcon = this.record.status === "running"
@@ -329,26 +541,57 @@ export class ConversationViewer implements Component {
     lines.push(hrMid);
 
     // Content area — rebuild every render (live data, no cache needed)
-    const contentLines = this.buildContentLines(innerW);
+    const contentLines = this.fullscreen ? this.scrollView.render(width - 1) : this.buildContentLines(innerW);
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
-
-    if (this.autoScroll) {
+    if (this.fullscreen) {
+      this.scrollView.updateLayout(contentLines.length, viewportHeight, () => {
+        if (!this.closed) this.tui.requestRender();
+      });
+      if (this.scrollView.isFollowingEnd) this.newMessages = 0;
+    } else if (this.autoScroll) {
       this.scrollOffset = maxScroll;
     }
 
-    const visibleStart = Math.min(this.scrollOffset, maxScroll);
+    const visibleStart = this.fullscreen ? this.scrollView.scrollTop : Math.min(this.scrollOffset, maxScroll);
     const visible = contentLines.slice(visibleStart, visibleStart + viewportHeight);
+    // Match Pi's scrollbar geometry: rounded size, at least two rows when available.
+    const thumbHeight = Math.min(viewportHeight, Math.max(2, Math.round(viewportHeight * viewportHeight / Math.max(1, contentLines.length))));
+    const thumbTop = maxScroll > 0 ? Math.round(visibleStart / maxScroll * (viewportHeight - thumbHeight)) : 0;
+    this.viewport = { width, top: lines.length, height: viewportHeight, maxScroll, thumbTop, thumbHeight };
 
     for (let i = 0; i < viewportHeight; i++) {
-      lines.push(row(visible[i] ?? ""));
+      let scrollbar: string | undefined;
+      if (this.scrollView.isScrollbarVisible) {
+        const onThumb = i >= thumbTop && i < thumbTop + thumbHeight;
+        if (onThumb) {
+          scrollbar = th.fg("scrollbarThumb", this.scrollView.isScrollbarActive ? "█" : "┃");
+        } else {
+          scrollbar = th.fg("scrollbarTrack", "│");
+        }
+      }
+      lines.push(row(visible[i] ?? "", scrollbar));
     }
 
-    // Footer
-    lines.push(hrMid);
+    // Keep the divider pinned above the footer, with the jump control centered
+    // inside it. Neither scrolling nor new messages change its position.
+    if (this.fullscreen && !this.scrollView.isFollowingEnd && maxScroll > 0 && rows >= this.chromeLines()) {
+      const text = this.newMessages > 0
+        ? `${this.newMessages} new message${this.newMessages === 1 ? "" : "s"}`
+        : "Jump to latest message";
+      const label = truncateToWidth(`[ ↓ ${text} · ${this.keys.jumpToLatestLabel()} ]`, innerW, "…");
+      const labelWidth = visibleWidth(label);
+      const padding = Math.floor((innerW - labelWidth) / 2);
+      this.latestTarget = { row: lines.length, start: padding + 1, end: padding + 1 + labelWidth };
+      lines.push(row(th.fg("dim", "─".repeat(padding)) + th.fg("accent", label) + th.fg("dim", "─".repeat(innerW - padding - labelWidth))));
+    } else {
+      lines.push(hrMid);
+    }
     if (this.composer) {
       // Composer row: the Input renders its own `> ` prompt and cursor.
+      this.composer.focused = this.focused;
       lines.push(row(this.composer.render(innerW)[0] ?? ""));
+      footerActions.push({ label: "Enter send", key: "\r" }, { label: "Esc cancel", key: "\x1b" });
       const composeHint = th.fg("dim", "Enter send · Esc cancel");
       const composeLeft = th.fg("accent", "✎ steer");
       const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
@@ -358,15 +601,18 @@ export class ConversationViewer implements Component {
       // full key list so the less-obvious bindings stay discoverable; it leads
       // the right group so "Esc close" is the only part that truncates first.
       const sep = th.fg("dim", " · ");
-      const actions: string[] = [];
-      if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
+      if (this.canSteer()) footerActions.push({ label: "Enter steer", key: "\r" });
+      // Abbreviated for the same reason as the Markdown group below.
+      if (this.canSendToBackground()) footerActions.push({ label: "b bg", key: "b" });
       if (this.isStoppable()) {
-        actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
+        footerActions.push({ label: this.stopArmed ? "x again to STOP" : "x stop", key: "x" });
       }
       // Abbreviated (`raw`/`md`/`md+`) because the idle footer is already full
       // at 80 columns with steer + stop present, and this group has no
       // degradation step below "drop the line-count readout".
-      actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
+      footerActions.push({ label: `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`, key: "m" });
+      const actions = footerActions.map(a => th.fg(a.key === "x" && this.stopArmed ? "error" : "dim", a.label));
+      footerActions.push({ label: "Esc close", key: "\x1b" });
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
@@ -383,9 +629,21 @@ export class ConversationViewer implements Component {
       const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
       lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
     }
-    lines.push(hrBot);
-
-    return lines;
+    if (!this.fullscreen) {
+      lines.push(hrBot);
+      return lines;
+    }
+    // Keep the footer on screen even in a terminal shorter than the chrome.
+    const footer = lines.pop() ?? row("");
+    const output = rows > 0 ? [...lines.slice(0, rows - 1), footer] : [];
+    const footerText = stripTerminalSequences(footer);
+    for (const action of footerActions) {
+      const index = footerText.indexOf(action.label);
+      if (index < 0) continue; // a clipped label is not a clickable control
+      const start = visibleWidth(footerText.slice(0, index));
+      this.footerTargets.push({ start, end: start + visibleWidth(action.label), key: action.key });
+    }
+    return output;
   }
 
   /** Stoppable only when a stop handler exists and the agent is still active. */
@@ -405,7 +663,7 @@ export class ConversationViewer implements Component {
   }
 
   /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
+  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): readonly string[] {
     let entry = this.markdownCache.get(msg);
     if (!entry) {
       entry = {
@@ -454,6 +712,15 @@ export class ConversationViewer implements Component {
     return !!this.onSteer && (this.record.status === "running" || this.record.status === "queued");
   }
 
+  /**
+   * Asked of the owner rather than derived from the record: only the caller
+   * blocked on this run knows it can let go of it, and `blocking` alone also
+   * matches spawns nobody can hand off (the agent generator).
+   */
+  private canSendToBackground(): boolean {
+    return this.onBackground?.available() === true;
+  }
+
   /** Open the inline steering composer and route subsequent input to it. */
   private openComposer(): void {
     const input = new Input();
@@ -476,6 +743,7 @@ export class ConversationViewer implements Component {
 
   dispose(): void {
     this.closed = true;
+    this.scrollView.setScrollbar("hidden"); // clears Pi's auto-hide timer
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = undefined;
@@ -485,6 +753,7 @@ export class ConversationViewer implements Component {
   // ---- Private ----
 
   private viewportHeight(): number {
+    if (this.fullscreen) return Math.max(0, this.tui.terminal.rows - this.chromeLines());
     // Cap mirrors the overlay's maxHeight — otherwise the viewer would render
     // more lines than the overlay shows and clip the footer.
     const maxRows = Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100);
@@ -493,7 +762,7 @@ export class ConversationViewer implements Component {
 
   private chromeLines(): number {
     // The composer adds one row above the footer hint while it's open.
-    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
+    return CHROME_LINES_BASE - (this.fullscreen ? 2 : 0) + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
   }
 
   private invocationLine(): string | undefined {
@@ -519,6 +788,14 @@ export class ConversationViewer implements Component {
       return lines;
     }
 
+    // A result is folded into the block of the call it answers, so every call
+    // has to find its result before the loop reaches it.
+    const results = new Map<string, ToolResultPart>();
+    for (const msg of messages) {
+      if (msg.role === "toolResult") results.set(msg.toolCallId, msg);
+    }
+    const foldedCalls = new Set<string>();
+
     const mode = this.markdownMode();
     let needsSeparator = false;
     for (const msg of messages) {
@@ -534,12 +811,10 @@ export class ConversationViewer implements Component {
         }
       } else if (msg.role === "assistant") {
         const textParts: string[] = [];
-        const toolCalls: string[] = [];
+        const toolCalls: ToolCallPart[] = [];
         for (const c of msg.content) {
           if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
-          }
+          else if (c.type === "toolCall") toolCalls.push(c);
         }
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
@@ -549,10 +824,24 @@ export class ConversationViewer implements Component {
             ? this.rawLines(text, width, false)
             : this.markdownLines(msg, text, width, false)));
         }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
+        for (const call of toolCalls) {
+          if (!this.toolRendering) {
+            lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${call.name}]`), width));
+            continue;
+          }
+          foldedCalls.add(call.id);
+          // An aborted or failed response never runs its calls, so no result
+          // will arrive: say so, as pi's session replay does.
+          const notRun = msg.stopReason === "aborted" ? "Operation aborted"
+            : msg.stopReason === "error" ? msg.errorMessage || "Error"
+            : undefined;
+          lines.push(...this.toolBlockLines(call, results.get(call.id), notRun, width));
         }
       } else if (msg.role === "toolResult") {
+        // Rendered under its call above. A result whose call is not in the
+        // transcript — a compacted prefix, a reopened session — keeps the plain
+        // block, because there is no call row to fold it into.
+        if (foldedCalls.has(msg.toolCallId)) continue;
         const { text, elided } = capResult(extractText(msg.content).trim());
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
@@ -585,6 +874,64 @@ export class ConversationViewer implements Component {
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
     }
 
-    return lines.map(l => truncateToWidth(l, width));
+    // Only clamp what actually overflows: `truncateToWidth` takes a slow,
+    // character-by-character path for any line carrying an escape sequence, and
+    // a tool block's rows are already rendered at this width by its component.
+    return lines.map(l => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
+  }
+
+  /**
+   * One tool call as pi draws it in the main transcript: the arguments on the
+   * call, then the result in that tool's own format — a bash box, read line
+   * numbers, an edit diff. Blocks are cached per call id because
+   * `ToolExecutionComponent` rebuilds its renderer tree on every update.
+   *
+   * A tool without a renderer still renders: the component falls back to a
+   * generic `name key=value` header plus a bounded preview that the expand key
+   * unfolds.
+   */
+  private toolBlockLines(call: ToolCallPart, result: ToolResultPart | undefined, notRun: string | undefined, width: number): readonly string[] {
+    let block = this.toolBlocks.get(call.id);
+    let changed = false;
+    if (!block) {
+      // Built the way pi replays a saved session: `session.messages` only holds
+      // finished messages, so the arguments are final. No setArgsComplete() or
+      // markExecutionStarted() — both request a render, and this runs inside
+      // one; the former also makes the edit renderer re-read the file.
+      const component = new ToolExecutionComponent(
+        call.name,
+        call.id,
+        call.arguments,
+        // Text only: an image needs rows this line-based renderer cannot reserve.
+        { showImages: false },
+        // pi's resolution for the agent's own session: builtin and extension
+        // renderers, and extension overrides. `{}` for a tool no registry knows,
+        // so it gets the bounded, expandable fallback rather than a raw dump.
+        // A conversation read back from disk has no registry: the fallback renderer.
+        this.session.extensionRunner?.resolveToolRenderers(call.name, () => this.session.getToolDefinition?.(call.name)) ?? {},
+        this.tui,
+        this.session.sessionManager?.getCwd() ?? process.cwd(),
+      );
+      component.setExpanded(this.toolsExpanded);
+      // The message is final, so this is decided once, when the block is built.
+      if (notRun && !result) component.updateResult({ content: [{ type: "text", text: notRun }], isError: true });
+      block = { component };
+      this.toolBlocks.set(call.id, block);
+      changed = true;
+    }
+    if (result && block.result !== result) {
+      block.result = result;
+      block.component.updateResult({
+        content: result.content,
+        details: result.details,
+        isError: result.isError,
+        durationMs: result.durationMs,
+      });
+      changed = true;
+    }
+    if (!changed && block.rows && block.width === width) return block.rows;
+    block.rows = block.component.render(width);
+    block.width = width;
+    return block.rows;
   }
 }

@@ -1,15 +1,17 @@
-import { Editor, visibleWidth } from "@earendil-works/pi-tui";
+import { Editor, type OverlayOptions, type TuiMode, type TuiMouseEvent, type TuiMouseEventResult, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
 import { registerAgents } from "../src/agent-types.js";
 import type { AgentConfig, AgentRecord, ViewerMarkdownMode } from "../src/types.js";
 import { type AgentActivity, getDisplayName } from "../src/ui/agent-widget.js";
+import type { ViewerBackgroundAction } from "../src/ui/conversation-viewer.js";
 import {
   FleetList,
   type FleetUICtx,
   type FleetWorkflow,
   formatFleetElapsed,
   formatFleetTokens,
+  formatProgressBar,
 } from "../src/ui/fleet-list.js";
 
 // ---- Key sequences (see node_modules/@earendil-works/pi-tui/dist/keys.js) ----
@@ -59,6 +61,7 @@ function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
     startedAt: Date.now(),
     session: FAKE_SESSION as any,
     lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0 },
+    ownUsage: { input: 13100, output: 0, cacheWrite: 0 },
     compactionCount: 0,
     ...over,
   } as AgentRecord;
@@ -83,12 +86,18 @@ interface Harness {
   openedWorkflows: () => string[];
   /** Settle the workflow dialog the list last opened; flushes the close microtask. */
   closeWorkflowDialog: () => Promise<void>;
+  /** Notices the fleet pushed through `ui.notify`, as `level: message`. */
+  notices: () => string[];
   /** The overlay component (a real ConversationViewer) once one is opened. */
   overlayComponent: () => { handleInput(data: string): void } | undefined;
+  /** Overlay options resolved after the custom factory runs. */
+  overlayOptions: () => OverlayOptions | undefined;
   /** Feed a key to the registered input handler; returns the consume result. */
   press: (data: string) => { consume?: boolean } | undefined;
   /** Render the currently-registered below-editor widget at the given width. */
   render: (width?: number) => string[];
+  /** Send a mouse event to the widget at the given line (render first, so the line map exists). */
+  mouse: (type: TuiMouseEvent["type"], y: number, button?: TuiMouseEvent["button"]) => TuiMouseEventResult | undefined;
   setEditorText: (t: string) => void;
   /** Whether an overlay has been opened. */
   overlayOpened: () => boolean;
@@ -107,6 +116,7 @@ function makeWorkflow(over: Partial<FleetWorkflow> = {}): FleetWorkflow {
     status: "running",
     doneCount: 1,
     totalCount: 3,
+    phase: "",
     startedAt: Date.now() - 32_000,
     tokens: 26_400,
     ...over,
@@ -116,25 +126,32 @@ function makeWorkflow(over: Partial<FleetWorkflow> = {}): FleetWorkflow {
 function harness(
   agents: AgentRecord[],
   opts: {
+    tuiMode?: TuiMode;
     viewerMarkdown?: () => ViewerMarkdownMode;
     onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+    backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction;
   } = {},
 ): Harness {
+  const notices: string[] = [];
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
-  let widgetFactory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
+  let widgetFactory: ((tui: any, theme: any) => {
+    render(w: number): string[];
+    handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
+  }) | undefined;
   let editorText = "";
   let opened = false;
   let closed = false;
   let overlayDone: ((r: undefined) => void) | undefined;
   let overlayComponent: { handleInput(data: string): void } | undefined;
-  const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows: 40 } };
+  let overlayOptions: OverlayOptions | undefined;
+  const fakeTui = { mode: opts.tuiMode ?? "regular", handleMouse: () => undefined, requestRender: () => {}, terminal: { columns: 120, rows: 40 } };
 
   const ui: FleetUICtx = {
     setWidget: (_key, content) => { widgetFactory = content as any; },
     onTerminalInput: (h) => { inputHandler = h; return () => { inputHandler = undefined; }; },
     getEditorText: () => editorText,
-    notify: () => {},
-    custom: ((factory: any) => {
+    notify: (message, level) => { notices.push(`${level}: ${message}`); },
+    custom: ((factory: any, options?: { overlayOptions?: OverlayOptions | (() => OverlayOptions) }) => {
       opened = true;
       return new Promise<undefined>((resolve) => {
         const done = (r: undefined) => { closed = true; overlayDone = undefined; resolve(r); };
@@ -142,12 +159,13 @@ function harness(
         // Construct the overlay component so the controller wires viewerClose,
         // and keep it so tests can drive the real ConversationViewer's input.
         overlayComponent = factory(fakeTui, theme, undefined, done);
+        overlayOptions = typeof options?.overlayOptions === "function" ? options.overlayOptions() : options?.overlayOptions;
       });
     }) as FleetUICtx["custom"],
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
+  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown, undefined, opts.backgroundAction);
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -167,9 +185,14 @@ function harness(
     closeWorkflowDialog: async () => { closeWorkflowDialog?.(); await Promise.resolve(); },
     ui,
     manager,
+    notices: () => notices,
     overlayComponent: () => overlayComponent,
+    overlayOptions: () => overlayOptions,
     press: (data) => inputHandler?.(data),
     render: (width = 120) => (widgetFactory ? widgetFactory(fakeTui, theme).render(width) : []),
+    mouse: (type, y, button = "left") => widgetFactory?.(fakeTui, theme).handleMouse?.({
+      type, button, x: 4, y, screenX: 4, screenY: 30 + y, width: 120, height: 10, shift: false, alt: false, ctrl: false,
+    }),
     setEditorText: (t) => { editorText = t; },
     overlayOpened: () => opened,
     overlayClosed: () => closed,
@@ -204,15 +227,6 @@ describe("FleetList navigation", () => {
     expect(h.render()).toEqual([]);
   });
 
-  it("hides nested child records from the coordinator fleet", () => {
-    const h = harness([
-      makeRecord({ id: "top", description: "top-level" }),
-      makeRecord({ id: "nested", description: "nested-child", parentAgentId: "top" }),
-    ]);
-    const output = h.render().join("\n");
-    expect(output).toContain("top-level");
-    expect(output).not.toContain("nested-child");
-  });
 
   it("activates on ↓ at an empty prompt, consuming the key", () => {
     const h = harness([makeRecord()]);
@@ -240,11 +254,11 @@ describe("FleetList navigation", () => {
     ]);
     h.press(DOWN);          // activate → selection on main (idx 0)
     h.press(DOWN_RELEASE);  // release half of the SAME tap — must be a no-op
-    expect(h.render().find(l => l.includes("main"))).toContain("●");
+    expect(h.render().find(l => l.includes("main"))).toContain("❯");
     h.press(DOWN);          // a real second tap → first agent
     h.press(DOWN_RELEASE);
-    expect(h.render().find(l => l.includes("one"))).toContain("●");
-    expect(h.render().find(l => l.includes("two"))).toContain("○");
+    expect(h.render().find(l => l.includes("one"))).toContain("❯");
+    expect(h.render().find(l => l.includes("two"))).not.toContain("❯");
   });
 
   it("renders the whole selected row in the theme's primary text color (#230)", () => {
@@ -255,8 +269,8 @@ describe("FleetList navigation", () => {
     h.press(DOWN); // activate → main
     h.press(DOWN); // → a1
     const selected = h.render().find(l => l.includes("one"))!;
-    // Selection marker keeps accent color; row content uses primary text color.
-    expect(selected).toContain("<accent>●</accent>");
+    // The cursor keeps accent color; row content uses primary text color.
+    expect(selected).toContain("<accent>❯</accent>");
     expect(selected).toContain("<text>one</text>");
     expect(selected).toMatch(/<text>\d+s · ↓ [\d.]+k? tokens<\/text>/);
     // Agent display name rendered with the text token too (this type has no badge).
@@ -264,6 +278,7 @@ describe("FleetList navigation", () => {
     // Inactive rows keep the muted/dim treatment.
     const unselected = h.render().find(l => l.includes("two"))!;
     expect(unselected).toContain("<dim>○</dim>");
+    expect(unselected).not.toContain("❯");
     expect(unselected).toMatch(/<dim>\d+s · ↓ [\d.]+k? tokens<\/dim>/);
     expect(unselected).not.toContain("<text>");
   });
@@ -301,11 +316,11 @@ describe("FleetList navigation", () => {
     const h = harness(agents);
     h.press(DOWN); // activate → index 0 (main)
     h.press(DOWN); // → 1 (a1)
-    expect(h.render().find(l => l.includes("one"))).toContain("●");
+    expect(h.render().find(l => l.includes("one"))).toContain("❯");
     h.press(DOWN); // → 2 (a2)
     h.press(DOWN); // clamp at 2
-    expect(h.render().find(l => l.includes("two"))).toContain("●");
-    expect(h.render().find(l => l.includes("one"))).toContain("○");
+    expect(h.render().find(l => l.includes("two"))).toContain("❯");
+    expect(h.render().find(l => l.includes("one"))).not.toContain("❯");
   });
 
   it("↑ above 'main' deactivates (returns to the prompt)", () => {
@@ -406,6 +421,23 @@ describe("FleetList vs other focused components (#123)", () => {
     expect(h.press(DOWN)).toEqual({ consume: true });
   });
 
+  it("activates under another extension's editor that is not an Editor subclass (#374)", () => {
+    // ui.setEditorComponent accepts any EditorComponent; pi-voice-stt's
+    // VoiceEditorWrapper implements the interface without extending Editor.
+    const h = harness([makeRecord()]);
+    focusInHarness(h, {
+      render: () => [], invalidate: () => {}, handleInput: () => {},
+      getText: () => "", setText: () => {},
+    });
+    expect(h.press(DOWN)).toEqual({ consume: true });
+  });
+
+  it("does not steal ↓ from a selector that handles input but holds no text (#374)", () => {
+    const h = harness([makeRecord()]);
+    focusInHarness(h, { render: () => [], invalidate: () => {}, handleInput: () => {} });
+    expect(h.press(DOWN)).toBeUndefined();
+  });
+
   it("assumes the editor when focus is unknowable (no tui yet / nothing focused)", () => {
     const h = harness([makeRecord()]);
     // No render yet → the list has never seen a tui: activation must still work.
@@ -417,11 +449,14 @@ describe("FleetList rendering", () => {
   it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
     const h = harness([makeRecord({ description: "Sleep then report 1" })]);
     const lines = h.render(120);
-    // hint + blank + main + one agent
+    // hint + blank + main + one agent + blank
     expect(lines[0]).toContain("← for agents");
-    expect(lines.find(l => l.includes("main"))).toContain("●"); // main selected by default
+    const mainLine = lines.find(l => l.includes("main"))!;
+    expect(mainLine).toContain("●"); // main is the view in front
+    expect(mainLine).not.toContain("❯"); // no cursor until the list is entered
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("○");
+    expect(agentLine).not.toContain("❯");
     expect(agentLine).toContain(getDisplayName("general-purpose"));
     expect(agentLine).toContain("↓ 13.1k tokens");
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
@@ -458,6 +493,17 @@ describe("FleetList rendering", () => {
     expect(lines.some(l => l.includes("↓ 3 more"))).toBe(true);
   });
 
+  it("ends with a blank spacer so the last row clears pi's footer (#351)", () => {
+    const one = harness([makeRecord({ description: "only agent" })]).render(120);
+    expect(one.at(-1)).toBe("");
+    expect(one.at(-2)).toContain("only agent");
+
+    const many = harness(Array.from({ length: 8 }, (_, i) =>
+      makeRecord({ id: `a${i}`, description: `report ${i}` }))).render(120);
+    expect(many.at(-1)).toBe("");
+    expect(many.at(-2)).toContain("↓ 3 more");
+  });
+
   it("never emits a line wider than the terminal (guards wrap-induced flicker)", () => {
     const agents = Array.from({ length: 8 }, (_, i) =>
       makeRecord({ id: `a${i}`, description: `a very long agent description number ${i} that keeps going` }));
@@ -477,12 +523,368 @@ describe("FleetList rendering", () => {
     // step down to the last agent (8 agents → roster index 8)
     for (let i = 0; i < 8; i++) h.press(DOWN);
     const lines = h.render(120);
-    expect(lines.find(l => l.includes("report 7"))).toContain("●");
+    expect(lines.find(l => l.includes("report 7"))).toContain("❯");
     expect(lines.some(l => l.includes("↑"))).toBe(true); // hidden-above indicator
   });
 });
 
+describe("FleetList nested agents", () => {
+  /** Visible rows of a render, each trimmed of the stats column. */
+  function rows(h: Harness): string[] {
+    return h.render(200).map(plain).filter(l => /○|●/.test(l)).map(l => l.replace(/\s{2,}\d+s · .*$/, ""));
+  }
+
+  it("indents nested children under their parent, siblings earliest-launched first", () => {
+    const h = harness([
+      makeRecord({ id: "top", description: "parent", startedAt: 1000 }),
+      makeRecord({ id: "late", description: "late child", parentAgentId: "top", startedAt: 3000 }),
+      makeRecord({ id: "early", description: "early child", parentAgentId: "top", startedAt: 2000 }),
+      makeRecord({ id: "other", description: "second top", startedAt: 4000 }),
+    ]);
+    const agent = getDisplayName("general-purpose");
+    expect(rows(h)).toEqual([
+      "  ● main",
+      `  ○ ${agent}  parent`,
+      `  ├ ○ ${agent}  early child`,
+      `  └ ○ ${agent}  late child`,
+      `  ○ ${agent}  second top`,
+    ]);
+  });
+
+  it("continues the rail under a non-last child and leaves it blank under the last", () => {
+    const h = harness([
+      makeRecord({ id: "top", description: "parent", startedAt: 1000 }),
+      makeRecord({ id: "c1", description: "first", parentAgentId: "top", startedAt: 2000 }),
+      makeRecord({ id: "g1", description: "grandchild a", parentAgentId: "c1", startedAt: 3000 }),
+      makeRecord({ id: "c2", description: "second", parentAgentId: "top", startedAt: 4000 }),
+      makeRecord({ id: "g2", description: "grandchild b", parentAgentId: "c2", startedAt: 5000 }),
+    ]);
+    const agent = getDisplayName("general-purpose");
+    expect(rows(h).slice(1)).toEqual([
+      `  ○ ${agent}  parent`,
+      `  ├ ○ ${agent}  first`,
+      `  │ └ ○ ${agent}  grandchild a`,
+      `  └ ○ ${agent}  second`,
+      `    └ ○ ${agent}  grandchild b`,
+    ]);
+  });
+
+  it("keeps a viewed child listed after its parent would have dropped out", () => {
+    // A parent settling stops its children, so both finish together; the child
+    // a reader is viewing stays listed, and so must the row it hangs from.
+    const done = Date.now() - 60_000;
+    const agents = [
+      makeRecord({ id: "top", description: "parent", startedAt: 1000 }),
+      makeRecord({ id: "kid", description: "the child", parentAgentId: "top", startedAt: 2000 }),
+    ];
+    const h = harness(agents);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER); // view the child
+    agents[0] = { ...agents[0], status: "completed", completedAt: done } as AgentRecord;
+    agents[1] = { ...agents[1], status: "completed", completedAt: done } as AgentRecord;
+    const rendered = h.render(200).map(plain).join("\n");
+    expect(rendered).toContain("parent");
+    expect(rendered).toContain("the child");
+  });
+
+  it("drops a child whose parent is not listed", () => {
+    const h = harness([
+      makeRecord({ id: "gone", description: "finished parent", status: "completed", completedAt: Date.now() - 60_000 }),
+      makeRecord({ id: "orphan", description: "orphan child", parentAgentId: "gone" }),
+      makeRecord({ id: "live", description: "live agent" }),
+    ]);
+    const rendered = h.render().map(plain).join("\n");
+    expect(rendered).toContain("live agent");
+    expect(rendered).not.toContain("orphan child");
+  });
+
+  it("keeps a workflow's agents and their children out of the agent rows", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "mine" }),
+      makeRecord({ id: "w1", description: "workflow agent", workflowId: "wf_abc123" }),
+      makeRecord({ id: "w1c", description: "workflow grandchild", parentAgentId: "w1" }),
+    ]);
+    const rendered = h.render().map(plain).join("\n");
+    expect(rendered).toContain("mine");
+    expect(rendered).not.toContain("workflow agent");
+    expect(rendered).not.toContain("workflow grandchild");
+  });
+
+  it("navigates into a child row and opens the child's own conversation", () => {
+    const child = makeRecord({ id: "kid", description: "the child", parentAgentId: "top", startedAt: 2000 });
+    const h = harness([makeRecord({ id: "top", description: "parent", startedAt: 1000 }), child]);
+    h.press(DOWN); // main
+    h.press(DOWN); // parent
+    h.press(DOWN); // child
+    expect(h.render(200).find(l => l.includes("the child"))).toContain("❯");
+    h.press(ENTER);
+    expect(h.overlayOpened()).toBe(true);
+    h.overlayComponent()!.handleInput("\r");
+    for (const ch of "hi") h.overlayComponent()!.handleInput(ch);
+    h.overlayComponent()!.handleInput("\r");
+    expect(h.manager.steer).toHaveBeenCalledWith("kid", "hi");
+  });
+
+  it("shows each agent's own usage, not the total that folds in its children", () => {
+    const h = harness([
+      makeRecord({
+        id: "top", description: "parent", startedAt: 1000,
+        lifetimeUsage: { input: 500_000, output: 0, cacheWrite: 0 },
+        ownUsage: { input: 163_400, output: 0, cacheWrite: 0 },
+      }),
+      makeRecord({
+        id: "kid", description: "child", parentAgentId: "top", startedAt: 2000,
+        lifetimeUsage: { input: 336_600, output: 0, cacheWrite: 0 },
+        ownUsage: { input: 336_600, output: 0, cacheWrite: 0 },
+      }),
+    ]);
+    const lines = h.render(200).map(plain);
+    expect(lines.find(l => l.includes("parent"))).toContain("↓ 163.4k tokens");
+    expect(lines.find(l => l.includes("child"))).toContain("↓ 336.6k tokens");
+  });
+
+  // A nested spawn inserts its row under the parent, mid-list. The cursor must
+  // stay on the agent it was on, or Enter opens (and steers, and stops) another.
+  it("keeps the cursor on its agent when a child row is inserted above it", () => {
+    const now = Date.now();
+    const agents = [
+      makeRecord({ id: "A", description: "parent A", startedAt: now - 5000 }),
+      makeRecord({ id: "A1", description: "child one", parentAgentId: "A", startedAt: now - 4000 }),
+      makeRecord({ id: "B", description: "agent B", startedAt: now - 3000 }),
+    ];
+    const h = harness(agents);
+    h.press(DOWN); // activate on main
+    h.press(DOWN); h.press(DOWN); h.press(DOWN); // A, A1, B
+    const cursorRow = () => h.render(200).map(plain).find(l => l.startsWith("❯"));
+    expect(cursorRow()).toContain("agent B");
+
+    agents.push(makeRecord({ id: "A2", description: "child two", parentAgentId: "A", startedAt: now - 1000 }));
+    h.fleet.update();
+    expect(cursorRow()).toContain("agent B");
+
+    h.press(ENTER);
+    expect((h.fleet as unknown as { viewingAgentId?: string }).viewingAgentId).toBe("B");
+  });
+
+  // The roster can change between ticks; a key pressed before the next
+  // update() must still act on the agent the cursor was on.
+  it("opens the cursor's agent even when the insert lands between ticks", () => {
+    const now = Date.now();
+    const agents = [
+      makeRecord({ id: "A", description: "parent A", startedAt: now - 5000 }),
+      makeRecord({ id: "B", description: "agent B", startedAt: now - 3000 }),
+    ];
+    const h = harness(agents);
+    h.press(DOWN); h.press(DOWN); h.press(DOWN); // main, A, B
+    agents.push(makeRecord({ id: "A1", description: "child", parentAgentId: "A", startedAt: now - 1000 }));
+    h.press(ENTER); // no update() since the insert
+    expect((h.fleet as unknown as { viewingAgentId?: string }).viewingAgentId).toBe("B");
+  });
+
+  // When the agent under the cursor leaves the list, the cursor stays at its
+  // position (clamped), as it did before: the next row takes the slot.
+  it("leaves the cursor in place when its own agent drops out", () => {
+    const now = Date.now();
+    const agents = [
+      makeRecord({ id: "A", description: "agent A", startedAt: now - 5000 }),
+      makeRecord({ id: "B", description: "agent B", startedAt: now - 4000 }),
+      makeRecord({ id: "C", description: "agent C", startedAt: now - 3000 }),
+    ];
+    const h = harness(agents);
+    h.press(DOWN); h.press(DOWN); h.press(DOWN); // main, A, B
+    agents.splice(1, 1); // B gone
+    h.fleet.update();
+    expect(h.render(200).map(plain).find(l => l.startsWith("❯"))).toContain("agent C");
+  });
+});
+
+describe("FleetList markers", () => {
+  it("keeps the codebase's ●/○ circles, never ⏺/◯ (#122, #155)", () => {
+    // `◯` renders oversized in many terminal fonts; #155 moved FleetView off
+    // the Claude Code glyphs onto the pair the rest of the UI uses.
+    const h = harness([
+      makeRecord({ id: "top", description: "parent", startedAt: 1000 }),
+      makeRecord({ id: "kid", description: "child", parentAgentId: "top", startedAt: 2000 }),
+    ]);
+    h.press(DOWN);
+    h.press(DOWN);
+    const rendered = h.render(200).join("\n");
+    expect(rendered).toContain("●");
+    expect(rendered).toContain("○");
+    expect(rendered).not.toMatch(/[⏺◯]/);
+  });
+
+  it("marks the open overlay's agent as the view in front, and main otherwise", async () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER); // open a1
+    const open = h.render(200).map(plain);
+    expect(open.find(l => l.includes("one"))).toContain("●");
+    expect(open.find(l => l.includes("main"))).toContain("○");
+    expect(open.find(l => l.includes("two"))).toContain("○");
+    await h.closeOverlay();
+    const closed = h.render(200).map(plain);
+    expect(closed.find(l => l.includes("main"))).toContain("●");
+    expect(closed.find(l => l.includes("one"))).toContain("○");
+  });
+});
+
+describe("FleetList mouse", () => {
+  /** Line index of the row containing `text` in the latest render. */
+  function lineOf(h: Harness, text: string): number {
+    return h.render().findIndex(l => plain(l).includes(text));
+  }
+
+  it("moves the ❯ cursor to the hovered row, and clears it off the rows", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    expect(h.mouse("move", lineOf(h, "two"))).toEqual({ handled: true, render: true });
+    expect(h.render().find(l => l.includes("two"))).toContain("❯");
+    expect(h.render().find(l => l.includes("one"))).not.toContain("❯");
+    // Same row again: nothing to redraw.
+    expect(h.mouse("move", lineOf(h, "two"))).toBeUndefined();
+    // The hint line is not a row.
+    expect(h.mouse("move", 0)).toEqual({ handled: true, render: true });
+    expect(h.render().some(l => l.includes("❯"))).toBe(false);
+  });
+
+  it("clears the hover cursor on a key", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.mouse("move", lineOf(h, "one"));
+    h.setEditorText("x");
+    h.press("x");
+    expect(h.render().some(l => l.includes("❯"))).toBe(false);
+  });
+
+  it("moves the keyboard selection when hovering while the list is active", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    h.press(DOWN); // active on main
+    h.mouse("move", lineOf(h, "two"));
+    h.press(ENTER);
+    expect(h.overlayOpened()).toBe(true);
+    h.overlayComponent()!.handleInput("\r");
+    for (const ch of "go") h.overlayComponent()!.handleInput(ch);
+    h.overlayComponent()!.handleInput("\r");
+    expect(h.manager.steer).toHaveBeenCalledWith("a2", "go");
+  });
+
+  it("does not scroll the window under a pointer hovering a scrolled list", () => {
+    // Moving the selection re-windows the list; if hover moved it, hovering the
+    // top visible row would jump the window back to the top and shift every
+    // row under the pointer.
+    const agents = Array.from({ length: 8 }, (_, i) =>
+      makeRecord({ id: `a${i}`, description: `report ${i}` }));
+    const h = harness(agents);
+    h.press(DOWN);
+    for (let i = 0; i < 8; i++) h.press(DOWN); // on report 7, window scrolled
+    const line = lineOf(h, "report 3"); // top visible row
+    h.mouse("move", line);
+    expect(h.render().some(l => l.includes("↑ 3 more"))).toBe(true);
+    expect(plain(h.render()[line])).toContain("report 3");
+    expect(h.render()[line]).toContain("❯");
+  });
+
+  it("acts on the hovered row when a key follows a hover", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+      makeRecord({ id: "a3", description: "three" }),
+    ]);
+    h.press(DOWN); // active on main
+    h.mouse("move", lineOf(h, "one"));
+    h.press(DOWN); // continues from the hovered row
+    expect(h.render().find(l => l.includes("two"))).toContain("❯");
+  });
+
+  it("claims a left press on a row so the click comes back, and ignores other buttons", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    expect(h.mouse("press", lineOf(h, "one"))).toEqual({ handled: true });
+    expect(h.mouse("press", lineOf(h, "one"), "right")).toBeUndefined();
+    expect(h.mouse("press", 0)).toBeUndefined();
+  });
+
+  it("opens the clicked agent's conversation", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    h.mouse("click", lineOf(h, "two"));
+    expect(h.overlayOpened()).toBe(true);
+    h.overlayComponent()!.handleInput("\r");
+    for (const ch of "hey") h.overlayComponent()!.handleInput(ch);
+    h.overlayComponent()!.handleInput("\r");
+    expect(h.manager.steer).toHaveBeenCalledWith("a2", "hey");
+  });
+
+  it("opens nothing on a click on main", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.mouse("click", lineOf(h, "main"));
+    expect(h.overlayOpened()).toBe(false);
+  });
+
+  it("maps a click to the right agent when the list is scrolled", () => {
+    const agents = Array.from({ length: 8 }, (_, i) =>
+      makeRecord({ id: `a${i}`, description: `report ${i}` }));
+    const h = harness(agents);
+    h.press(DOWN);
+    for (let i = 0; i < 8; i++) h.press(DOWN); // on report 7: "↑ 3 more" shifts every row down
+    expect(h.render().some(l => l.includes("↑ 3 more"))).toBe(true);
+    h.mouse("click", lineOf(h, "report 5"));
+    h.overlayComponent()!.handleInput("\r");
+    for (const ch of "ok") h.overlayComponent()!.handleInput(ch);
+    h.overlayComponent()!.handleInput("\r");
+    expect(h.manager.steer).toHaveBeenCalledWith("a5", "ok");
+  });
+
+  it("ignores the mouse while an overlay is open", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    h.mouse("click", lineOf(h, "one"));
+    expect(h.mouse("move", lineOf(h, "two"))).toBeUndefined();
+    expect(h.mouse("press", lineOf(h, "two"))).toBeUndefined();
+    expect(h.mouse("click", lineOf(h, "two"))).toBeUndefined();
+  });
+
+  it("ignores the mouse while another component has focus", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.widgetTui.focusedComponent = { kind: "selector" };
+    expect(h.mouse("move", lineOf(h, "one"))).toBeUndefined();
+    expect(h.mouse("click", lineOf(h, "one"))).toBeUndefined();
+    expect(h.overlayOpened()).toBe(false);
+  });
+});
+
 describe("FleetList overlay lifecycle", () => {
+  it.each<{ mode: TuiMode; expected: OverlayOptions }>([
+    { mode: "regular", expected: { anchor: "center", width: "90%", maxHeight: "70%" } },
+    { mode: "fullscreen", expected: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 } },
+  ])("opens the agent viewer with options for the active $mode TUI", async ({ mode, expected }) => {
+    const h = harness([makeRecord()], { tuiMode: mode });
+    try {
+      h.press(DOWN); // activate (main)
+      h.press(DOWN); // select the agent
+      h.press(ENTER);
+
+      expect(h.overlayOptions()).toEqual(expected);
+    } finally {
+      await h.closeOverlay();
+      h.fleet.dispose();
+    }
+  });
+
   it("Enter on 'main' just deactivates (no overlay)", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN); // active, index 0 (main)
@@ -507,8 +909,35 @@ describe("FleetList overlay lifecycle", () => {
     agents.splice(0, 1);
     await h.closeOverlay();
     // Selection follows a2 ("two") to its new position, not whatever is at idx 2 now.
-    expect(h.render().find(l => l.includes("two"))).toContain("●");
-    expect(h.render().find(l => l.includes("three"))).toContain("○");
+    expect(h.render().find(l => l.includes("two"))).toContain("❯");
+    expect(h.render().find(l => l.includes("three"))).not.toContain("❯");
+  });
+
+  it("wires the viewer's b to the extension's action for that row, notifying through the session UI", () => {
+    const agents = [makeRecord({ id: "live", description: "the one" })];
+    const backgroundAction = vi.fn((record: AgentRecord, notify: (message: string) => void) => ({
+      available: () => true,
+      send: () => notify(`sent ${record.id}`),
+    }));
+    const h = harness(agents, { backgroundAction });
+    h.press(DOWN);  // activate (main)
+    h.press(DOWN);  // → the agent
+    h.press(ENTER); // open the conversation viewer
+
+    expect(backgroundAction).toHaveBeenCalledWith(agents[0], expect.any(Function));
+    h.overlayComponent()!.handleInput("b");
+    expect(h.notices()).toEqual(["info: sent live"]);
+  });
+
+  it("offers no b when the extension supplies no action", () => {
+    const agents = [makeRecord({ id: "live", description: "the one" })];
+    const h = harness(agents);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    expect(() => h.overlayComponent()!.handleInput("b")).not.toThrow();
+    expect(h.notices()).toEqual([]);
   });
 
   it("wires the viewer's steer composer to manager.steer with the agent id", () => {
@@ -571,7 +1000,7 @@ describe("FleetList cost display", () => {
   const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 
   function row(showCost: boolean, cost: number, activity?: Map<string, AgentActivity>): string {
-    const record = makeRecord({ lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost } });
+    const record = makeRecord({ ownUsage: { input: 13100, output: 0, cacheWrite: 0, cost } });
     const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), () => showCost);
     let factory: any;
     fleet.setUICtx({
@@ -610,6 +1039,91 @@ describe("FleetList cost display", () => {
     } as unknown as AgentActivity]]);
 
     expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+  });
+});
+
+describe("FleetList model display", () => {
+  const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  const SONNET: AgentRecord["invocation"] = { modelName: "sonnet 4.6", modelId: "anthropic/claude-sonnet-4-6", thinking: "high" };
+
+  /** A fleet over one record (or `records`), with `showModel` read live from `state.on`. */
+  function mount(state: { on: boolean }, invocation: AgentRecord["invocation"] = SONNET, records = [makeRecord({ invocation })]) {
+    // showModel is the last positional arg; the middle args take their defaults.
+    const fleet = new FleetList(fakeManager(records), new Map(), () => false, undefined, undefined, undefined, undefined, () => state.on);
+    let factory: any;
+    fleet.setUICtx({
+      setWidget: (_k: string, c: any) => { factory = c; },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: (() => new Promise(() => {})) as any,
+    } as any);
+    return {
+      fleet,
+      render: (width = 120): string => {
+        fleet.update();
+        return factory({ requestRender: () => {}, terminal: { columns: width, rows: 40 } }, theme).render(width).join("\n");
+      },
+    };
+  }
+
+  it("names the model and bare thinking level after the description when enabled", () => {
+    const out = mount({ on: true }).render();
+    // Bare level, not "thinking: high" — the label is dropped on this surface,
+    // matching the widget's running row.
+    expect(out).toContain("Sleep then report 1 · sonnet 4.6 · high");
+    expect(out).not.toContain("thinking:");
+    // On the left, ahead of the right-aligned stats.
+    expect(out.indexOf("sonnet 4.6")).toBeLessThan(out.indexOf("token"));
+    // The short label, never the canonical id.
+    expect(out).not.toContain("anthropic/claude-sonnet-4-6");
+  });
+
+  it("shows no model or thinking level when disabled", () => {
+    const out = mount({ on: false }).render();
+    expect(out).not.toContain("sonnet 4.6");
+    expect(out).not.toContain("high");
+  });
+
+  it("keeps the (asked X) annotations", () => {
+    const out = mount({ on: true }, {
+      modelName: "haiku 4.5", requestedModel: "opus", thinking: "high", requestedThinking: "max",
+    }).render();
+    expect(out).toContain("haiku 4.5 (asked opus) · high (asked max)");
+  });
+
+  it("cuts the model, not the agent name or stats, on a narrow terminal", () => {
+    const out = mount({ on: true }, {
+      modelName: "haiku 4.5", requestedModel: "opus", thinking: "high", requestedThinking: "max",
+    }).render(60);
+    expect(out).toContain("Agent  Sleep then report 1");
+    expect(out).toContain("13.1k tokens");
+    expect(out).not.toContain("(asked max)");
+  });
+
+  it("names each nested row's own model after its tree prefix and description", () => {
+    const now = Date.now();
+    const records = [
+      makeRecord({ id: "top", description: "parent", startedAt: now - 2000, invocation: SONNET }),
+      makeRecord({ id: "kid", description: "child", parentAgentId: "top", startedAt: now - 1000, invocation: { modelName: "haiku 4.5", thinking: "low" } }),
+    ];
+    const agent = getDisplayName("general-purpose");
+    const wide = plain(mount({ on: true }, undefined, records).render());
+    expect(wide).toContain(`○ ${agent}  parent · sonnet 4.6 · high`);
+    expect(wide).toContain(`  └ ○ ${agent}  child · haiku 4.5 · low`);
+    // Narrow: the indented child loses its model, never its rail or name.
+    const narrow = plain(mount({ on: true }, undefined, records).render(48));
+    expect(narrow).toContain(`  └ ○ ${agent}  child`);
+    expect(narrow).not.toContain("haiku 4.5 · low");
+  });
+
+  it("picks up a live toggle on the next update", () => {
+    const state = { on: false };
+    const { render } = mount(state);
+    expect(render()).not.toContain("sonnet 4.6");
+    state.on = true;
+    expect(render()).toContain("sonnet 4.6 · high");
   });
 });
 
@@ -661,20 +1175,49 @@ describe("FleetList workflow rows", () => {
     const h = harness([makeRecord({ id: "a1", description: "one" })]);
     h.setWorkflows([makeWorkflow()]);
 
-    const rows = h.render().map(plain).filter(row => row.trim() !== "");
+    // Wide enough that the test theme's `<tag>` markup, which counts toward
+    // the width, does not truncate the row.
+    const rows = h.render(200).map(plain).filter(row => row.trim() !== "");
     const run = rows.find(row => row.includes("audit-src"))!;
     const agent = rows.findIndex(row => row.includes("one"));
-    expect(run).toContain("workflow");
-    expect(run).toContain("1/3 agents");
+    // Labelled like an agent's type; 1/3 of 20 cells rounds to 7, and the count
+    // follows the bar rather than heading the flush-right stats.
+    expect(run).toContain(`○ workflow  audit-src  ${"▰".repeat(7)}${"▱".repeat(13)} 1/3 agents `);
+    expect(run).not.toContain("1/3 · ");
     expect(run).toContain("26.4k tokens");
     // A run owns most of the agents under it, so the container comes first.
     expect(rows.findIndex(row => row.includes("audit-src"))).toBeLessThan(agent);
   });
 
-  it("agrees with itself about a single-agent run", () => {
+  it("names the active phases after the count", () => {
+    const h = harness([]);
+    h.setWorkflows([makeWorkflow({ phase: "Reviewing (2/3)" })]);
+    const run = h.render(200).map(plain).find(row => row.includes("audit-src"))!;
+    expect(run).toContain("1/3 agents · Reviewing (2/3) ");
+  });
+
+  it("fills the bar completely on a finished single-agent run", () => {
     const h = harness([]);
     h.setWorkflows([makeWorkflow({ doneCount: 1, totalCount: 1 })]);
-    expect(h.render().map(plain).join("\n")).toContain("1/1 agent ");
+    const out = h.render(200).map(plain).join("\n");
+    expect(out).toContain("▰".repeat(20));
+    expect(out).not.toContain("▱");
+    expect(out).toContain(`${"▰".repeat(20)} 1/1 agents `);
+  });
+
+
+  it("formatProgressBar scales done/total into 20 cells", () => {
+    const cells = (done: number, total: number) => {
+      const bar = formatProgressBar(done, total);
+      return [bar.filled.length, bar.empty.length];
+    };
+    expect(cells(0, 9)).toEqual([0, 20]);
+    expect(cells(8, 9)).toEqual([18, 2]);
+    expect(cells(9, 9)).toEqual([20, 0]);
+    // No agents scheduled yet: all empty, not NaN cells.
+    expect(cells(0, 0)).toEqual([0, 20]);
+    // A count that overshoots never draws past the bar.
+    expect(cells(12, 9)).toEqual([20, 0]);
   });
 
   it("hides the run's own agents — the run is the row that represents them", () => {
@@ -771,8 +1314,9 @@ describe("FleetList workflow rows", () => {
     ]);
     await h.closeWorkflowDialog();
 
-    expect(h.render().find(l => l.includes("review-changes"))).toContain("●");
-    expect(h.render().find(l => l.includes("started-meanwhile"))).not.toContain("●");
+    // Wide: the fake theme's markup tags count as visible text.
+    expect(h.render(200).find(l => l.includes("review-changes"))).toContain("❯");
+    expect(h.render(200).find(l => l.includes("started-meanwhile"))).not.toContain("❯");
   });
 
   it("still opens an agent's viewer when the selection is past the runs", () => {

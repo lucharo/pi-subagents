@@ -33,45 +33,13 @@ export interface PromptExtras {
    * `get_subagent_result` — so terse raw data would be the wrong answer there.
    */
   workflowChild?: boolean;
-}
-
-/**
- * Whether a prompt carries pi's own skills catalog: the formatter's fixed preamble line followed by
- * `<available_skills>`. Both renderings have it (pi 1.x inside a `<skills>` section, pi 0.84 bare), and a
- * `<skills>` block someone writes in AGENTS.md does not.
- */
-const SKILLS_CATALOG = /The following skills provide specialized instructions for specific tasks\.[\s\S]*?<available_skills>[\s\S]*?<\/available_skills>/g;
-
-export function hasSkillsCatalog(prompt: string | undefined): boolean {
-  return !!prompt && /The following skills provide specialized instructions for specific tasks\.[\s\S]*?<available_skills>/.test(prompt);
-}
-
-const unescapeXml = (text: string) =>
-  text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
-
-/**
- * A `skillsOverride` for the child's resource loader that keeps every skill loaded but marks the ones the
- * inherited catalog already lists (by `<location>`) `disableModelInvocation`, so pi renders only the child's
- * own additions. `/skill:name` still expands (the registry is intact), and skills that extensions add while
- * binding go through the same override: one the parent already lists is hidden, one only the child has stays.
- */
-export function hideSkillsListedIn(parentSystemPrompt: string) {
-  // only entries inside pi's own catalog(s), never a <location> quoted elsewhere (an XML example in AGENTS.md)
-  const catalogs = [...parentSystemPrompt.matchAll(SKILLS_CATALOG)].map((m) => m[0]).join("\n");
-  const listed = new Set([...catalogs.matchAll(/<location>([^<]*)<\/location>/g)].map((m) => unescapeXml(m[1])));
-  return <S extends { filePath: string; disableModelInvocation: boolean }, D>(base: { skills: S[]; diagnostics: D[] }) => ({
-    ...base,
-    skills: base.skills.map((skill) => (listed.has(skill.filePath) ? { ...skill, disableModelInvocation: true } : skill)),
-  });
-}
-
-/**
- * The prompt without pi's skills catalog: the whole `<skills>` section when the catalog is all it holds (pi 1.x),
- * else the catalog alone (pi 0.84). Used when a `subagents:child-resources` listener sets `skillsCatalog: false`.
- */
-export function removeSkillsCatalog(prompt: string): string {
-  const section = /\n*<skills>\s*The following skills provide specialized instructions for specific tasks\.[\s\S]*?<\/available_skills>\s*<\/skills>/g;
-  return prompt.replace(section, "").replace(SKILLS_CATALOG, "");
+  /**
+   * Set only for the built-in general-purpose, and only when it received the
+   * nested `Agent` tool. Claude Code's general-purpose prompt closes with this
+   * line; without it a delegating agent tends to hand its whole task to one
+   * child. An agent that cannot spawn gets nothing to misread.
+   */
+  delegationGuideline?: boolean;
 }
 
 /**
@@ -94,9 +62,9 @@ export interface PromptToolInfo {
 /**
  * The inherited parent prompt without the lines that describe tools the child does not have.
  *
- * In append mode a child gets the parent's prompt verbatim, including its tool list and the rule bullets each
- * parent tool contributed. This drops, from pi's own preamble only (before any `<project_context>`, in the one
- * rendering it uses: pi 1.x `<tools>`/`<rules>` sections or pi 0.84 "Available tools:"/"Guidelines:"):
+ * In append mode a child inherits the parent's `<tools>` and `<rules>` sections verbatim (see
+ * {@link inheritableParentPrompt}), including the rule bullets each parent tool contributed. This drops, from pi's
+ * own sections only (the first `<tools>` and `<rules>` before any `<project_context>`):
  * - a tool line `- name: …` (or `- a / b: …`) when every tool it names is a parent tool the child lacks;
  * - a rule bullet when every parent tool that contributed it (by `promptGuidelines`) is one the child lacks.
  * Lines naming no parent tool, pi's own rules, and anything outside those two lists stay as they are.
@@ -126,21 +94,15 @@ export function stripLackedToolLines(prompt: string, parentTools: PromptToolInfo
     const by = owners.get(text.trim());
     return !!by && by.every(lacks);
   };
-  // Only pi's own preamble, before any project context (AGENTS.md may hold a <tools> block of its own), and only
-  // the rendering that preamble uses.
+  // Only pi's own sections, before any project context (AGENTS.md may hold a <tools> block of its own). Pi
+  // writes its own <tools> and <rules> first, so the first match of each is pi's.
   const ctxAt = prompt.search(/(^|\n)<project_context>/);
   const head = ctxAt === -1 ? prompt : prompt.slice(0, ctxAt);
   const tail = ctxAt === -1 ? "" : prompt.slice(ctxAt);
-  const tagged = /(^|\n)<tools>\n/.test(head);
-  const lists: Array<[RegExp, (text: string) => boolean]> = tagged
-    ? [
-        [/((?:^|\n)<tools>\n)([\s\S]*?)(\n<\/tools>)/, dropTool],
-        [/((?:^|\n)<rules>\n)([\s\S]*?)(\n<\/rules>)/, dropRule],
-      ]
-    : [
-        [/(\nAvailable tools:\n)([\s\S]*?)(\n\n)/, dropTool],
-        [/(\nGuidelines:\n)([\s\S]*?)(\n\n)/, dropRule],
-      ];
+  const lists: Array<[RegExp, (text: string) => boolean]> = [
+    [/((?:^|\n)<tools>\n)([\s\S]*?)(\n<\/tools>)/, dropTool],
+    [/((?:^|\n)<rules>\n)([\s\S]*?)(\n<\/rules>)/, dropRule],
+  ];
   let out = head;
   for (const [re, drop] of lists) {
     out = out.replace(re, (_all, open: string, body: string, close: string) => open + filterBullets(body, drop) + close);
@@ -199,6 +161,11 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
 </workflow_child>`
     : "";
 
+  // Append mode only: the one agent that gets this, general-purpose, is append.
+  const delegationBlock = extras?.delegationGuideline
+    ? "\n\nYou are already the dedicated agent for this task. Do the work directly — do not re-delegate your entire assignment to another single subagent."
+    : "";
+
   // Build optional extras suffix
   const extraSections: string[] = [];
   if (extras?.memoryBlock) {
@@ -236,7 +203,7 @@ You are operating as a sub-agent invoked to handle a specific task.
     // placed verbatim (no wrapper tag) so it forms an identical byte prefix
     // with the parent session, maximising KV cache hits. The <active_agent>
     // tag and env block vary per call and are placed after the cached prefix.
-    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
+    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + delegationBlock + customSection + extrasSuffix;
   }
 
   // "replace" mode — env header + the config's full system prompt
@@ -246,6 +213,57 @@ You have been invoked to handle a specific task autonomously.
 ${envBlock}`;
 
   return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
+}
+
+/**
+ * The part of the parent's rendered system prompt that an append-mode child inherits.
+ *
+ * Pi renders a prompt as the preamble followed by tagged sections in a fixed order:
+ * `tools`, `rules`, `docs` (default preamble only), `addendum`, `project_context`,
+ * `skills`, `cwd`, then the sections extensions add during a turn. The child session renders its own `skills` (from its `skills:`
+ * setting), its own `cwd` and its own extension sections after the inherited text.
+ * Inheriting the parent's copies too listed them twice, showed the parent's skills to
+ * children configured with `skills: false` or a preload list, and left copies that
+ * section-editing extensions in the child cannot reach. It also made the result depend
+ * on timing: `getSystemPrompt()` includes the extension sections only while the
+ * parent's turn runs.
+ *
+ * Returns the text before the `skills` section, or before the `cwd` section when there
+ * are no skills. A prompt without the `cwd` section (for example, a forced prompt) is
+ * returned unchanged.
+ *
+ * @param rendered  The parent's `ctx.getSystemPrompt()`.
+ * @param cwd  The cwd the parent's prompt was rendered with.
+ */
+export function inheritableParentPrompt(rendered: string, cwd: string): string {
+  const cwdAt = rendered.lastIndexOf(cwdSection(cwd));
+  if (cwdAt < 0) return rendered;
+  const head = rendered.slice(0, cwdAt);
+  if (!head.endsWith("\n</skills>")) return head;
+  const skillsAt = head.lastIndexOf("\n\n<skills>\n");
+  return skillsAt < 0 ? head : head.slice(0, skillsAt);
+}
+
+/**
+ * The parent's rendered system prompt without its `cwd` section, for a session that
+ * renders its own `cwd` after the prompt it is given and adds nothing else.
+ *
+ * Everything else is kept, including sections after `cwd` (extension sections present
+ * while the parent's turn runs). A prompt without the section (for example, a forced
+ * prompt) is returned unchanged.
+ *
+ * @param rendered  The parent's `ctx.getSystemPrompt()`.
+ * @param cwd  The cwd the parent's prompt was rendered with.
+ */
+export function withoutCwdSection(rendered: string, cwd: string): string {
+  const section = cwdSection(cwd);
+  const at = rendered.lastIndexOf(section);
+  return at < 0 ? rendered : rendered.slice(0, at) + rendered.slice(at + section.length);
+}
+
+/** The `cwd` section as pi renders it after the preceding section. */
+function cwdSection(cwd: string): string {
+  return `\n\n<cwd>\n${cwd.replace(/\\/g, "/")}\n</cwd>`;
 }
 
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */

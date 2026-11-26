@@ -5,7 +5,7 @@ description: "Rules for SubagentWorkflow scripts that keep one sweep to one run.
 
 # Subagent workflows
 
-The `SubagentWorkflow` tool description is the API reference: globals, `agent()` options, `pipeline()`, `resumeFromRunId`. This skill is how to use it so a sweep runs once, cheaply, and fails where you can see it.
+The `workflow-authoring` skill (or the `SubagentWorkflow` tool description, which carries it inline by default) is the API reference: globals, `agent()` options, `pipeline()`, `resumeFromRunId`. This skill is how to use it so a sweep runs once, cheaply, and fails where you can see it.
 
 ## Pass the work list as data
 

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
+import { getAvailableTypes, registerAgents, setFallbackSubagent, setToolDescriptionMode } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
@@ -14,10 +14,10 @@ let records: Map<string, any>;
 let spawn: ReturnType<typeof vi.fn>;
 let spawnAndWait: ReturnType<typeof vi.fn>;
 
-function writeAgent(name: string, extra = "") {
+function writeAgent(name: string, extra = "", description = name) {
   const dir = join(cwd, ".pi", "agents");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${name}.md`), `---\ndescription: ${name}\ntools: read\n${extra}---\n${name}\n`);
+  writeFileSync(join(dir, `${name}.md`), `---\ndescription: ${description}\ntools: read\n${extra}---\n${name}\n`);
 }
 
 const MODELS = [
@@ -81,15 +81,47 @@ beforeEach(() => {
     awaitStartup: vi.fn(async () => {}),
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),
+    // A record's run counts as settled only when a test flags it.
+    settledChildren: (parentId: string) => [...records.values()].filter(r => r.parentAgentId === parentId && r.settled),
+    waitForChild: vi.fn(async () => false),
   } as any;
 });
 
 afterEach(() => {
   setScopeModelsEnabled(false);
+  setToolDescriptionMode("full");
   rmSync(cwd, { recursive: true, force: true });
 });
 
 describe("child-safe nested Agent tools", () => {
+  // The runner keeps a parent's run open until its background children report,
+  // so the parent must not hand in an answer that calls them still running —
+  // the live failure was a child reporting "both are running" just before they
+  // were stopped.
+  it("tells the parent its background children report back before it returns", () => {
+    const [agent] = tools();
+    expect(agent.description).toContain("your run continues with its result before you return");
+    expect(agent.description).toContain("never report it as still running");
+  });
+
+  // #457: the child must see what each allowed agent is for, as the main
+  // session does — and nothing about agents outside its allowlist.
+  it("lists each allowed agent type with its description and tools", () => {
+    writeAgent("tracer", "", "Traces call sites. Use it for callers.");
+    const [agent] = tools(["tracer"]);
+    expect(agent.description).toContain("- tracer: Traces call sites. Use it for callers. (Tools: read)");
+    expect(agent.description).not.toContain("scout");
+    expect(agent.description).not.toContain("reviewer");
+  });
+
+  it("lists first sentences only under toolDescriptionMode compact", () => {
+    writeAgent("tracer", "", "Traces call sites. Use it for callers.");
+    setToolDescriptionMode("compact");
+    const [agent] = tools(["tracer"]);
+    expect(agent.description).toContain("- tracer: Traces call sites. (Tools: read)");
+    expect(agent.description).not.toContain("Use it for callers");
+  });
+
   it("allows any enabled agent when allowed_subagents is omitted", async () => {
     const [agent] = tools();
     const result = await execute(agent, {
@@ -286,6 +318,16 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).not.toHaveBeenCalled();
   });
 
+  // #368 — a nested resume carries the caller's turn budget like a spawn does.
+  it("passes max_turns through on a nested resume", async () => {
+    const [agent] = tools(["scout"]);
+    await execute(agent, { subagent_type: "scout", description: "find files", prompt: "Find them", run_in_background: true });
+
+    await execute(agent, { resume: "child-1", subagent_type: "scout", description: "continue", prompt: "Continue", max_turns: 3 });
+
+    expect(manager.resume).toHaveBeenCalledWith("child-1", "Continue", undefined, expect.objectContaining({ maxTurns: 3 }));
+  });
+
   it("reports a background child that fails to start as a tool error", async () => {
     // Under isolation: "worktree" the child is not running when spawn() returns
     // — the repo copy is awaited. The failure must reach the parent as an error
@@ -328,6 +370,24 @@ describe("child-safe nested Agent tools", () => {
     const result = await execute(getResult, { agent_id: record.id, wait: true });
 
     expect(result.content[0].text).toBe("queued done");
+  });
+
+  // A child stopped from the UI says "stopped" at once but keeps running until
+  // its prompt unwinds, and only then gets its final text. Read in that window,
+  // it must stay unread, so the parent's drain still delivers that text.
+  it("marks a result read only once the child's run has settled", async () => {
+    const [, getResult] = tools();
+    const record: Record<string, unknown> = { id: "stopping-child", status: "stopped", parentAgentId: "parent-1" };
+    records.set("stopping-child", record);
+
+    await execute(getResult, { agent_id: "stopping-child" });
+    expect(record.resultConsumed).toBeUndefined();
+
+    record.settled = true;
+    record.result = "PARTIAL_TEXT";
+    const result = await execute(getResult, { agent_id: "stopping-child" });
+    expect(result.content[0].text).toContain("PARTIAL_TEXT");
+    expect(record.resultConsumed).toBe(true);
   });
 
   it("aborts a nested result wait without aborting the owned child", async () => {
