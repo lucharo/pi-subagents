@@ -66,6 +66,80 @@ export function hideSkillsListedIn(parentSystemPrompt: string) {
 }
 
 /**
+ * The prompt without pi's skills catalog: the whole `<skills>` section when the catalog is all it holds (pi 1.x),
+ * else the catalog alone (pi 0.84). Used when a `subagents:child-resources` listener sets `skillsCatalog: false`.
+ */
+export function removeSkillsCatalog(prompt: string): string {
+  const section = /\n*<skills>\s*The following skills provide specialized instructions for specific tasks\.[\s\S]*?<\/available_skills>\s*<\/skills>/g;
+  return prompt.replace(section, "").replace(SKILLS_CATALOG, "");
+}
+
+/**
+ * A `skillsOverride` that keeps every skill loaded (so `/skill:name` expands) but marks each one
+ * `disableModelInvocation`, so pi renders no catalog for the child.
+ */
+export function hideAllSkills() {
+  return <S extends { disableModelInvocation: boolean }, D>(base: { skills: S[]; diagnostics: D[] }) => ({
+    ...base,
+    skills: base.skills.map((skill) => ({ ...skill, disableModelInvocation: true })),
+  });
+}
+
+/** A tool as the parent sees it: its name and the guideline bullets it adds to the prompt's rules. */
+export interface PromptToolInfo {
+  name: string;
+  promptGuidelines?: string[];
+}
+
+/**
+ * The inherited parent prompt without the lines that describe tools the child does not have.
+ *
+ * In append mode a child gets the parent's prompt verbatim, including its tool list and the rule bullets each
+ * parent tool contributed. This drops, from the first tool list and the first rules list only (pi 1.x
+ * `<tools>`/`<rules>` sections, pi 0.84 "Available tools:"/"Guidelines:"):
+ * - a tool line `- name: …` (or `- a / b: …`) when every tool it names is a parent tool the child lacks;
+ * - a rule bullet when every parent tool that contributed it (by `promptGuidelines`) is one the child lacks.
+ * Lines naming no parent tool, pi's own rules, and anything outside those two lists stay as they are.
+ */
+export function stripLackedToolLines(prompt: string, parentTools: PromptToolInfo[], childTools: Iterable<string>): string {
+  const has = new Set(childTools);
+  const parentNames = new Set(parentTools.map((t) => t.name));
+  const lacks = (name: string) => parentNames.has(name) && !has.has(name);
+  if (![...parentNames].some(lacks)) return prompt;
+  const owners = new Map<string, string[]>();
+  for (const tool of parentTools) {
+    for (const g of tool.promptGuidelines ?? []) {
+      const key = g.trim();
+      if (key) owners.set(key, [...(owners.get(key) ?? []), tool.name]);
+    }
+  }
+  // Bullets of one list: a chunk starts at "- " at the start of a line; continuation lines stay with it.
+  const filterBullets = (body: string, drop: (text: string) => boolean) =>
+    body.split(/\n(?=- )/).filter((chunk) => !(chunk.startsWith("- ") && drop(chunk.slice(2)))).join("\n");
+  const dropTool = (text: string) => {
+    const m = /^([^:\n]+):/.exec(text);
+    if (!m) return false;
+    const names = m[1].split(" / ").map((n) => n.trim());
+    return names.length > 0 && names.every(lacks);
+  };
+  const dropRule = (text: string) => {
+    const by = owners.get(text.trim());
+    return !!by && by.every(lacks);
+  };
+  const lists: Array<[RegExp, (text: string) => boolean]> = [
+    [/(<tools>\n)([\s\S]*?)(\n<\/tools>)/, dropTool],
+    [/(<rules>\n)([\s\S]*?)(\n<\/rules>)/, dropRule],
+    [/(\nAvailable tools:\n)([\s\S]*?)(\n\n)/, dropTool],
+    [/(\nGuidelines:\n)([\s\S]*?)(\n\n)/, dropRule],
+  ];
+  let out = prompt;
+  for (const [re, drop] of lists) {
+    out = out.replace(re, (_all, open: string, body: string, close: string) => open + filterBullets(body, drop) + close);
+  }
+  return out;
+}
+
+/**
  * Build the system prompt for an agent from its config.
  *
  * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)

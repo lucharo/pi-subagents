@@ -1,7 +1,7 @@
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn } from "../src/prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideAllSkills, hideSkillsListedIn, removeSkillsCatalog, stripLackedToolLines } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -550,5 +550,119 @@ describe("hideSkillsListedIn", () => {
       ["one", true],
       ["from-ext", false],
     ]);
+  });
+});
+
+describe("removeSkillsCatalog", () => {
+  const skill = (name: string) => ({
+    name,
+    description: `Use for ${name}.`,
+    filePath: `/skills/${name}/SKILL.md`,
+    baseDir: `/skills/${name}`,
+    sourceInfo: {} as never,
+    disableModelInvocation: false,
+  });
+
+  it("drops pi 1.x's whole <skills> section and leaves the sections around it", () => {
+    const catalog = formatSkillsForPrompt([skill("one")]).trim();
+    const prompt = `pre\n\n<rules>\n- x\n</rules>\n\n<skills>\n${catalog}\n</skills>\n\n<cwd>\n/w\n</cwd>`;
+    expect(removeSkillsCatalog(prompt)).toBe("pre\n\n<rules>\n- x\n</rules>\n\n<cwd>\n/w\n</cwd>");
+  });
+
+  it("drops the bare catalog pi 0.84 appends, and leaves a <skills> block from AGENTS.md", () => {
+    const own = "<project_context>\n<skills>\n- use tdd\n</skills>\n</project_context>";
+    const prompt = `You are pi.\n${own}${formatSkillsForPrompt([skill("one")])}\nCurrent working directory: /w`;
+    const out = removeSkillsCatalog(prompt);
+    expect(out).not.toContain("<available_skills>");
+    expect(out).toContain(own);
+    expect(out).toContain("Current working directory: /w");
+  });
+});
+
+describe("hideAllSkills", () => {
+  it("keeps every skill loaded and marks each one hidden from the catalog", () => {
+    const skills = [{ name: "a", disableModelInvocation: false }, { name: "b", disableModelInvocation: true }];
+    const out = hideAllSkills()({ skills, diagnostics: [] });
+    expect(out.skills.map((s) => [s.name, s.disableModelInvocation])).toEqual([["a", true], ["b", true]]);
+    expect(formatSkillsForPrompt(out.skills as never)).toBe("");
+    expect(skills[0].disableModelInvocation).toBe(false);
+  });
+});
+
+describe("stripLackedToolLines", () => {
+  const parentTools = [
+    { name: "read", promptGuidelines: [] },
+    { name: "bash", promptGuidelines: ["Use bash for shell work"] },
+    { name: "plan", promptGuidelines: ["Keep a plan for 3+ steps", "Update the plan as\nsteps move"] },
+    { name: "pin_widget", promptGuidelines: ["Pin a widget for long tasks"] },
+    { name: "unpin_widget", promptGuidelines: ["Pin a widget for long tasks"] },
+    { name: "list_sessions", promptGuidelines: ["Shared by two tools"] },
+    { name: "send_message", promptGuidelines: ["Shared by two tools"] },
+  ];
+
+  it("pi 1.x: drops tool lines and rule bullets of parent tools the child lacks", () => {
+    const prompt = [
+      "You are an expert coding assistant.",
+      "",
+      "<tools>",
+      "- read: Read files",
+      "- bash: Run commands",
+      "- plan: plan: show plans",
+      "- pin_widget / unpin_widget: pin widgets",
+      "- list_sessions / send_message: message sessions",
+      "- mystery: a tool the parent no longer has",
+      "",
+      "In addition to the tools above, you may have access to other custom tools depending on the project.",
+      "</tools>",
+      "",
+      "<rules>",
+      "- Use bash for shell work",
+      "- Keep a plan for 3+ steps",
+      "- Update the plan as",
+      "steps move",
+      "- Pin a widget for long tasks",
+      "- Shared by two tools",
+      "- Be concise in your responses",
+      "</rules>",
+      "",
+      "<project_context>",
+      "- plan: an AGENTS.md line that only looks like a tool line",
+      "</project_context>",
+    ].join("\n");
+    const out = stripLackedToolLines(prompt, parentTools, ["read", "bash", "send_message"]);
+    expect(out).toBe([
+      "You are an expert coding assistant.",
+      "",
+      "<tools>",
+      "- read: Read files",
+      "- bash: Run commands",
+      "- list_sessions / send_message: message sessions",
+      "- mystery: a tool the parent no longer has",
+      "",
+      "In addition to the tools above, you may have access to other custom tools depending on the project.",
+      "</tools>",
+      "",
+      "<rules>",
+      "- Use bash for shell work",
+      "- Shared by two tools",
+      "- Be concise in your responses",
+      "</rules>",
+      "",
+      "<project_context>",
+      "- plan: an AGENTS.md line that only looks like a tool line",
+      "</project_context>",
+    ].join("\n"));
+  });
+
+  it("pi 0.84: works on the Available tools and Guidelines lists", () => {
+    const prompt = "You are pi.\n\nAvailable tools:\n- read: Read files\n- plan: show plans\n\nIn addition…\n\nGuidelines:\n- Keep a plan for 3+ steps\n- Be concise in your responses\n\nPi documentation";
+    expect(stripLackedToolLines(prompt, parentTools, ["read"])).toBe(
+      "You are pi.\n\nAvailable tools:\n- read: Read files\n\nIn addition…\n\nGuidelines:\n- Be concise in your responses\n\nPi documentation",
+    );
+  });
+
+  it("changes nothing when the child has every parent tool", () => {
+    const prompt = "<tools>\n- plan: show plans\n</tools>\n\n<rules>\n- Keep a plan for 3+ steps\n</rules>";
+    expect(stripLackedToolLines(prompt, parentTools, parentTools.map((t) => t.name))).toBe(prompt);
   });
 });
