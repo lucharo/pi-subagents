@@ -2811,7 +2811,17 @@ describe("resolveDefaultModel", () => {
     const cc = { provider: "claude-code", id: "sonnet", name: "Sonnet" } as any;
     const sub = { provider: "claude-code@subscription", id: "sonnet", name: "Sonnet" } as any;
     const all = [cc, sub];
-    const r = { find: vi.fn((p: string, id: string) => all.find(m => m.provider === p && m.id === id)), getAvailable: () => all };
+    // a class instance whose find reads `this`, as pi's ModelRegistry does: a detached find would throw
+    class Registry {
+      models = all;
+      find(p: string, id: string) {
+        return this.models.find(m => m.provider === p && m.id === id);
+      }
+      getAvailable() {
+        return this.models;
+      }
+    }
+    const r = new Registry();
     expect(resolveDefaultModel(parent, r, "anthropic-vertex/claude-sonnet-4-6")).toBe(cc);
     expect(resolveDefaultModel({ provider: "claude-code@subscription", id: "opus" } as any, r, "anthropic-vertex/claude-sonnet-4-6")).toBe(sub);
     // not a Claude model: the parent's, as before

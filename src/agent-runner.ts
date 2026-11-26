@@ -389,7 +389,7 @@ export function resolveDefaultModel(
     // the parent's provider first, as the Agent tool resolves it
     const available = registry.getAvailable?.();
     if (available && claudeFamily(configModel)) {
-      const same = resolveModel(configModel, { find: registry.find, getAll: () => available, getAvailable: () => available }, { prefer: parentModel?.provider, family: true });
+      const same = resolveModel(configModel, { find: (p, id) => registry.find(p, id), getAll: () => available, getAvailable: () => available }, { prefer: parentModel?.provider, family: true });
       if (typeof same !== "string") return same;
     }
   }

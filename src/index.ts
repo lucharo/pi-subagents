@@ -3234,12 +3234,13 @@ Terse command-style prompts produce shallow, generic work.
   // so they are reachable from tests — this command handler is only registered
   // through `registerCommand`, which every test mocks.
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
+  function getModelLabel(type: string, registry?: ModelRegistry, parentProvider?: string): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
+    // resolved as a spawn resolves the pin (the Claude family step, the parent's login first)
+    const resolved = resolveModel(cfg.model, registry, { prefer: parentProvider, family: true });
     // Configured but unresolvable: the runtime silently falls back to the parent
     // model, so flag it (and the fallback) rather than hiding the config.
     if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
@@ -3344,7 +3345,7 @@ Terse command-style prompts produce shallow, generic work.
     const items: SettingItem[] = allNames.map(name => {
       const cfg = getAgentConfig(name);
       const disabled = cfg?.enabled === false;
-      const model = getModelLabel(name, ctx.modelRegistry);
+      const model = getModelLabel(name, ctx.modelRegistry, ctx.model?.provider);
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,

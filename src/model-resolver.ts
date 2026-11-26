@@ -42,10 +42,11 @@ export interface ResolveOptions {
    *  session on one login (e.g. `claude-code@subscription`) stays on it when
    *  another provider serves the same model id. */
   prefer?: string;
-  /** Let a Claude model no available provider has by its id run on the same
-   *  family's model ("claude-opus-4-7" → claude-code/opus). Only where the
-   *  caller says so with substitutionNote, or for an agent file's pin, which
-   *  otherwise falls back to the parent's model. */
+  /** The Claude steps: a Claude model by its full id is that model, asked of
+   *  the providers when none lists it (modelAsker), else the same family's model
+   *  ("claude-opus-4-1" → claude-code/opus). For an agent file's pin, which
+   *  otherwise falls back to the parent's model (only the Agent tool's result
+   *  says what ran), and for a caller's model in the Agent tool. */
   family?: boolean;
 }
 
@@ -189,7 +190,8 @@ export function resolveModel(
   // named provider is preferred when present; this only kicks in when it isn't,
   // so the same model from another provider beats falling back to "inherit".
   if (slashIdx !== -1) {
-    const bare = resolveModel(input.slice(slashIdx + 1), registry, options);
+    // (without the Claude steps: step 1b has asked for this id, and the family step runs once, below)
+    const bare = resolveModel(input.slice(slashIdx + 1), registry, { ...options, family: false });
     if (typeof bare !== "string") return bare;
   }
 
