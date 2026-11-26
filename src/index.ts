@@ -1835,7 +1835,7 @@ Terse command-style prompts produce shallow, generic work.
       let model = ctx.model;
       let modelNote = "";
       if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry, { prefer: ctx.model?.provider });
+        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry, { prefer: ctx.model?.provider, family: true });
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
           // config-specified: fall back to the parent's model, and say so
@@ -1890,7 +1890,7 @@ Terse command-style prompts produce shallow, generic work.
       // resolves to nothing is still worth disclosing: it cannot have taken effect.
       const askedModel = ((asked: string | undefined) => {
         if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
+        const resolvedAsked = resolveModel(asked, ctx.modelRegistry, { prefer: ctx.model?.provider, family: true });
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
       })(resolvedConfig.overridden?.model);
@@ -1985,7 +1985,7 @@ Terse command-style prompts produce shallow, generic work.
           });
           const next = scheduler.getNextRun(job.id);
           return textResult(
-            `${fallbackNote}${modelNote}Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
+            `${fallbackNote}Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
             `Next run: ${next ?? "(unknown)"}. ` +
             `Manage via /agents → Scheduled jobs.`,
           );

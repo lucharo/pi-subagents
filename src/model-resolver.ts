@@ -42,6 +42,11 @@ export interface ResolveOptions {
    *  session on one login (e.g. `claude-code@subscription`) stays on it when
    *  another provider serves the same model id. */
   prefer?: string;
+  /** Let a Claude model no available provider has by its id run on the same
+   *  family's model ("claude-opus-4-7" → claude-code/opus). Only where the
+   *  caller says so with substitutionNote, or for an agent file's pin, which
+   *  otherwise falls back to the parent's model. */
+  family?: boolean;
 }
 
 /** The Claude family a model name belongs to ("claude-opus-4-7" → "opus"), or
@@ -67,9 +72,11 @@ export function substitutionNote(
   const asked = (slash === -1 ? input : input.slice(slash + 1)).toLowerCase().replace(/\./g, "-");
   const id = model.id.toLowerCase().replace(/\./g, "-");
   const namedOther = slash !== -1 && input.slice(0, slash).toLowerCase() !== model.provider.toLowerCase();
-  const sameModel = id === asked || id.startsWith(`${asked}-`) || asked.startsWith(`${id}-`);
+  // the same model: the same id, or one with a trailing date stamp the other lacks
+  const dated = (a: string, b: string) => a.startsWith(`${b}-`) && /^-\d{8}$/.test(a.slice(b.length));
+  const sameModel = id === asked || dated(id, asked) || dated(asked, id);
   const family = claudeFamily(input);
-  if (!sameModel && family && !id.includes(asked)) {
+  if (!sameModel && family) {
     return `Note: no model "${input}" is available here, so this ran on ${model.provider}/${model.id}, the same Claude family (${family}).\n\n`;
   }
   if (namedOther) {
@@ -158,7 +165,7 @@ export function resolveModel(
   // whose list may carry just its aliases) runs on the same family's model
   // where one is available: "claude-opus-4-7" → claude-code/opus. The caller
   // says so with substitutionNote.
-  const family = claudeFamily(input);
+  const family = options.family ? claudeFamily(input) : undefined;
   if (family) {
     const same = resolveModel(family, registry, options);
     if (typeof same !== "string") return same;

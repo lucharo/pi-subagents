@@ -262,7 +262,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHostHandl
       const config = getAgentConfig(dispatch.type);
       const modelInput = request.model ?? config?.model;
       if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry, { prefer: ctx.model?.provider });
+        const resolved = resolveModel(modelInput, ctx.modelRegistry, { prefer: ctx.model?.provider, family: request.model === undefined });
         if (typeof resolved === "string") {
           if (request.model !== undefined) return { ok: false, error: resolved };
         } else {
