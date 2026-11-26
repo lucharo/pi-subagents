@@ -281,6 +281,23 @@ export const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
  */
 export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData };
 
+/** The `harness-tools:replaces` declaration for `Agent`: the harness tools it replaces, by the name each harness's model
+ *  knows them by, pinned to the harness versions that have each name (Claude Code's changelog says "Task tool" up to
+ *  2.1.45 and "Agent tool" from 2.1.69; Codex's multi-agent `spawn_agent`). */
+export const HARNESS_TOOLS_REPLACES = "harness-tools:replaces";
+export const HARNESS_TOOLS_ASK = "harness-tools:ask";
+export const AGENT_REPLACES = {
+  tool: SUBAGENT_TOOL_NAMES.AGENT,
+  by: "pi-subagents",
+  replaces: {
+    "claude-code": [
+      { tools: ["Agent"], versions: ">=2.1.69" },
+      { tools: ["Task"], versions: "<2.1.69" },
+    ],
+    codex: [{ tools: ["spawn_agent"] }],
+  },
+};
+
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
@@ -2633,6 +2650,15 @@ Terse command-style prompts produce shallow, generic work.
   // mention-clone header on why the clone must call the registered tool.
   const registeredAgentTool = withUsageReporting(agentTool);
   pi.registerTool(registeredAgentTool);
+
+  // A harness model provider (Claude Code or Codex behind pi, e.g. fluide's pi-claude-code and pi-any-harness) offers
+  // the harness pi's own tools, and under its "prefer pi" mode switches off the harness's own tool wherever one of pi's
+  // does the same job. Declare that `Agent` replaces the harness's subagent tools, so the harness starts pi's agents,
+  // which pi shows, instead of its own in-process ones. Re-declared on `harness-tools:ask` for a provider that loads
+  // after this extension. Inert unless such a provider listens, and it applies only while `Agent` is offered.
+  const declareHarnessReplacement = () => pi.events.emit(HARNESS_TOOLS_REPLACES, AGENT_REPLACES);
+  declareHarnessReplacement();
+  pi.events.on(HARNESS_TOOLS_ASK, declareHarnessReplacement);
 
   // ---- Workflow tool ----
 
