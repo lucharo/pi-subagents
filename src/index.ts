@@ -700,6 +700,7 @@ export default function (pi: ExtensionAPI) {
     // Names a git ref to copy the worktree from: only `reopen` sets it, from a
     // branch this extension created. A forged one would reach git as an argument.
     delete safeOptions.worktreeFrom;
+    delete safeOptions.reopenInPlace;
     // Every spawn through here is DETACHED — the caller gets an id back and
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.

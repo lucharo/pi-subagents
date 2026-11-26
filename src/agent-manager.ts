@@ -310,6 +310,12 @@ interface SpawnOptions {
    */
   worktreeFrom?: string;
   /**
+   * Internal: set by `reopen` (fork, #14), which continues a released workflow
+   * child on its own record. Unlike any other reopen it keeps the child's
+   * isolation, from `worktreeFrom` when its last run saved changes.
+   */
+  reopenInPlace?: boolean;
+  /**
    * Working directory for the agent (absolute path). Default: parent session
    * cwd. The agent's tools operate here, but .pi config (extensions, skills,
    * settings, memory) still loads from the parent session's project — the
@@ -1036,7 +1042,7 @@ export class AgentManager {
     // A reopen never gets a worktree, as in Claude Code: a fresh copy of HEAD
     // would not hold the earlier run's edits, and a reopen whose old worktree
     // held any is refused before it gets here (`reopenTarget`).
-    const isolation = options.resumeSessionFile !== undefined
+    const isolation = options.resumeSessionFile !== undefined && options.reopenInPlace !== true
       ? undefined
       : options.workflowId !== undefined
         ? options.isolation
@@ -1316,11 +1322,9 @@ export class AgentManager {
         return "";
       });
 
-    this.trackRun(record, promise);
     // Raced against the stall check, so a run that never ends still lets its
-    // awaiters go once it has been settled from outside. `isSettling` keeps
-    // following the run itself.
-    record.promise = Promise.race([promise, dead.then(() => record.result ?? "")]);
+    // awaiters go once it has been settled from outside.
+    this.trackRun(record, promise, Promise.race([promise, dead.then(() => record.result ?? "")]));
 
     // Notify caller that spawn is complete (record is in the map, promise is set).
     // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
@@ -1428,6 +1432,7 @@ export class AgentManager {
       options: {
         ...base.options,
         resumeSessionFile: record.sessionFile,
+        reopenInPlace: true,
         // An isolated child continues from the branch its last run's changes
         // were saved to, so the work it remembers doing is in its tree.
         worktreeFrom: record.worktreeResult?.hasChanges ? record.worktreeResult.branch : undefined,
@@ -1955,8 +1960,7 @@ export class AgentManager {
         return "";
       });
 
-    this.trackRun(record, promise);
-    record.promise = Promise.race([promise, dead.then(() => record.result ?? "")]);
+    this.trackRun(record, promise, Promise.race([promise, dead.then(() => record.result ?? "")]));
   }
 
   /**
@@ -2285,12 +2289,18 @@ export class AgentManager {
     return pending;
   }
 
-  /** Set `record.promise`, and track it in `unsettled` until it settles. */
-  private trackRun(record: AgentRecord, promise: Promise<string>): void {
-    record.promise = promise;
-    this.unsettled.add(promise);
-    const done = () => { this.unsettled.delete(promise); };
-    promise.then(done, done);
+  /**
+   * Set `record.promise`, and track it in `unsettled` until it settles.
+   * `exposed` is what awaiters get when it differs from the run (fork: raced
+   * against the stall check). A run the stall check settled from outside counts
+   * as settled from then on, even if its own promise never ends: every waiter
+   * loops on `unsettled`, and a resolved promise left in it would spin them.
+   */
+  private trackRun(record: AgentRecord, promise: Promise<string>, exposed: Promise<string> = promise): void {
+    record.promise = exposed;
+    this.unsettled.add(exposed);
+    const done = () => { this.unsettled.delete(exposed); };
+    exposed.then(done, done);
   }
 
   /** Whether `record` is `rootId` itself or one of the agents it owns. */
