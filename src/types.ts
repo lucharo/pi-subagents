@@ -39,6 +39,9 @@ export interface AgentConfig {
   color?: string;
   description: string;
   builtinToolNames?: string[];
+  /** Built-in names the agent file's `tools:` lists itself (not the defaults an omitted `tools:` resolves to,
+   * nor a `*` expansion). A `subagents:child-resources` listener never removes these. */
+  namedToolNames?: string[];
   /** Raw `ext:` selector entries from the `tools:` CSV, e.g. ["ext:foo", "ext:bar/x"].
    * Presence of any entry flips extension tools to an explicit allowlist. */
   extSelectors?: string[];

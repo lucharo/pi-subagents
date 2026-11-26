@@ -25,7 +25,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { claudeFamily, resolveModel } from "./model-resolver.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, hasSkillsCatalog, hideAllSkills, hideSkillsListedIn, removeSkillsCatalog, stripLackedToolLines, type PromptExtras, type PromptToolInfo } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -628,6 +628,113 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+/** Event other extensions listen on to trim what a child loads and reads. */
+export const CHILD_RESOURCES_EVENT = "subagents:child-resources";
+
+/**
+ * Payload of {@link CHILD_RESOURCES_EVENT}. Listeners mutate it in place:
+ * - `excludeExtensions`: extension names, matched as `exclude_extensions:` entries are;
+ * - `excludeTools`: tool names dropped from the child, as `disallowed_tools:` entries are;
+ * - `skillsCatalog`: set `false` to leave the skills catalog out of the child's prompt (skills still load by name);
+ * - `promptNote`: one line appended to the child's prompt.
+ */
+export interface ChildResourcesRequest {
+  type: string;
+  excludeExtensions: string[];
+  excludeTools: string[];
+  skillsCatalog: boolean;
+  promptNote?: string;
+}
+
+/** What {@link askChildResources} applies, after the agent file's own settings won. */
+export interface ChildResources {
+  excludeExtensions?: string[];
+  excludeTools?: string[];
+  skillsCatalog?: false;
+  promptNote?: string;
+}
+
+const PROMPT_NOTE_MAX = 500;
+const names = (v: unknown): string[] =>
+  Array.isArray(v) ? [...new Set(v.filter((n): n is string => typeof n === "string" && n.length > 0))] : [];
+
+/**
+ * Ask listeners on the parent's `pi.events` what a child of `type` should leave
+ * out. `emit` runs listeners synchronously, so the payload holds their answer
+ * when it returns. Not asked for an isolated child.
+ *
+ * The agent file wins over a listener, field by field: `excludeExtensions` applies
+ * only when the agent inherits every extension (`extensions: true`, no
+ * `exclude_extensions:`); `skillsCatalog: false` only when it inherits every skill
+ * (`skills: true`); `excludeTools` never drops a tool the agent file names itself
+ * (`tools:` built-ins, `ext:ext/tool`). Returns undefined when no listener changed
+ * anything, so the child resolves exactly as before.
+ */
+export function askChildResources(
+  pi: { events?: { emit(channel: string, data: unknown): void } } | undefined,
+  type: string,
+  config: { extensions: true | string[] | false; excludeExtensions?: string[]; skills: true | string[] | false },
+  named: Iterable<string> = [],
+): ChildResources | undefined {
+  if (!pi?.events) return undefined;
+  const request: ChildResourcesRequest = { type, excludeExtensions: [], excludeTools: [], skillsCatalog: true };
+  try {
+    pi.events.emit(CHILD_RESOURCES_EVENT, request);
+  } catch {
+    return undefined; // a throwing listener must not stop the spawn
+  }
+  const out: ChildResources = {};
+  const inheritsExtensions = config.extensions === true && !config.excludeExtensions?.length;
+  const excludeExtensions = inheritsExtensions ? names(request.excludeExtensions) : [];
+  if (excludeExtensions.length) out.excludeExtensions = excludeExtensions;
+  const own = new Set(named);
+  const excludeTools = names(request.excludeTools).filter((n) => !own.has(n));
+  if (excludeTools.length) out.excludeTools = excludeTools;
+  if (request.skillsCatalog === false && config.skills === true) out.skillsCatalog = false;
+  if (typeof request.promptNote === "string") {
+    const note = request.promptNote.replace(/\s+/g, " ").trim().slice(0, PROMPT_NOTE_MAX);
+    if (note) out.promptNote = note;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** The parent's tools with their rule bullets, read through its `pi.getAllTools()`; [] when unavailable. */
+function readParentTools(pi: unknown): PromptToolInfo[] {
+  try {
+    const all = (pi as { getAllTools?: () => Array<{ name?: unknown; promptGuidelines?: unknown }> } | undefined)?.getAllTools?.();
+    if (!Array.isArray(all)) return [];
+    return all.flatMap((t) =>
+      typeof t?.name === "string"
+        ? [{ name: t.name, promptGuidelines: Array.isArray(t.promptGuidelines) ? t.promptGuidelines.filter((g): g is string => typeof g === "string") : [] }]
+        : [],
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * A view of `loader` whose `getSystemPrompt()` drops the lines of parent tools the tracked session
+ * lacks (see {@link stripLackedToolLines}). Until a session is tracked it returns the prompt unchanged.
+ * Everything else reads straight through to the loader.
+ */
+export function lackedToolLinesView<L extends { getSystemPrompt(): string | undefined }>(loader: L, parentTools: PromptToolInfo[]) {
+  let session: { getActiveToolNames(): string[] } | undefined;
+  const view = new Proxy(loader, {
+    get(target, prop) {
+      if (prop === "getSystemPrompt") {
+        return () => {
+          const prompt = target.getSystemPrompt();
+          return prompt && session ? stripLackedToolLines(prompt, parentTools, session.getActiveToolNames()) : prompt;
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { loader: view, track: (s: { getActiveToolNames(): string[] }) => { session = s; } };
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -653,12 +760,22 @@ export async function runAgent(
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
+  // Other extensions may trim what a child loads and reads (see askChildResources).
+  // Tools the agent file names itself are never taken away by a listener.
+  const ownToolNames = [
+    ...(agentConfig?.namedToolNames ?? []),
+    ...[...parseExtSelectors(agentConfig?.extSelectors ?? []).narrowing.values()].flatMap((set) => [...set]),
+  ];
+  const hooked = options.isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames);
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
   // isolation is an intentional override, not a misconfiguration.
-  const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
+  const excludeExtensions = options.isolated ? undefined : (hooked?.excludeExtensions ?? config.excludeExtensions);
   const skills = options.isolated ? false : config.skills;
+  // A listener's `skillsCatalog: false` (applied only when the agent inherits every skill): no catalog
+  // in the child's prompt, neither the inherited copy nor its own; skills still load by name.
+  const noCatalog = hooked?.skillsCatalog === false;
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
@@ -675,7 +792,8 @@ export async function runAgent(
   // (with any skill the parent got from --skill, which the child's loader would not find). Its own
   // loader still loads skills, so /skill:name expands, but renders only the ones the parent's lacks.
   const appendMode = (agentConfig?.promptMode ?? "append") === "append";
-  const inheritsCatalog = skills === true && appendMode && hasSkillsCatalog(parentSystemPrompt);
+  const inheritsCatalog = !noCatalog && skills === true && appendMode && hasSkillsCatalog(parentSystemPrompt);
+  const inheritedPrompt = noCatalog ? removeSkillsCatalog(parentSystemPrompt) : parentSystemPrompt;
 
   let toolNames = getToolNamesForType(type);
 
@@ -703,14 +821,15 @@ export async function runAgent(
   // Build system prompt from agent config
   let systemPrompt: string;
   if (agentConfig) {
-    systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, parentSystemPrompt, extras);
+    systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, inheritedPrompt, extras);
   } else {
     // Unknown type fallback: spread the canonical general-purpose config (defensive —
     // unreachable in practice since index.ts resolves unknown types before calling runAgent).
     const fallback = DEFAULT_AGENTS.get("general-purpose");
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
-    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
+    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, inheritedPrompt, extras);
   }
+  if (hooked?.promptNote) systemPrompt += `\n\n${hooked.promptNote}`;
 
   const agentDir = getAgentDir();
 
@@ -777,7 +896,7 @@ export async function runAgent(
     additionalExtensionPaths,
     extensionsOverride,
     noSkills,
-    skillsOverride: inheritsCatalog ? hideSkillsListedIn(parentSystemPrompt) : undefined,
+    skillsOverride: noCatalog ? hideAllSkills() : inheritsCatalog ? hideSkillsListedIn(parentSystemPrompt) : undefined,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -785,6 +904,13 @@ export async function runAgent(
     appendSystemPromptOverride: () => [],
   });
   await runInChildSessionContext(() => loader.reload());
+
+  // Append mode inherits the parent's prompt with its tool list and each parent tool's rule bullets.
+  // The child's own session reads its prompt through this view, which drops the lines of parent tools
+  // the child does not have, judged against the child's active tools on every rebuild (pi rebuilds the
+  // prompt whenever the active set changes, including late registrations).
+  const parentTools: PromptToolInfo[] = appendMode ? readParentTools(options.pi) : [];
+  const promptView = parentTools.length ? lackedToolLinesView(loader, parentTools) : undefined;
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -821,7 +947,9 @@ export async function runAgent(
   // Exclude typo check: compares against the PRE-filter discovered set (an excluded
   // name absent from the surviving set is the exclude working as intended). Also
   // flags path-like and "*" entries — excludes are plain names only.
-  if (hasExcludes && discoveredNames) {
+  // A listener's names cover extensions that may not be installed here; only the
+  // agent file's own excludes are typos worth flagging.
+  if (hasExcludes && discoveredNames && !hooked?.excludeExtensions) {
     for (const name of excludeNames) {
       if (!discoveredNames.has(name)) {
         options.onToolActivity?.({
@@ -863,9 +991,9 @@ export async function runAgent(
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
 
-  const disallowedSet = agentConfig?.disallowedTools
-    ? new Set(agentConfig.disallowedTools)
-    : undefined;
+  // A listener's `excludeTools` join the agent file's `disallowed_tools`.
+  const disallowedNames = [...(agentConfig?.disallowedTools ?? []), ...(hooked?.excludeTools ?? [])];
+  const disallowedSet = disallowedNames.length ? new Set(disallowedNames) : undefined;
 
   // Nested delegation tools (opt-in, ownership-scoped). Empty unless the agent
   // set `allowed_subagents` and a nestedRuntime was provided — and never when
@@ -1023,7 +1151,7 @@ export async function runAgent(
     model,
     tools: sessionTools,
     customTools: [...nestedTools, ...structuredTools],
-    resourceLoader: loader,
+    resourceLoader: promptView?.loader ?? loader,
   };
   if (sessionExcludeTools) {
     sessionOpts.excludeTools = sessionExcludeTools;
@@ -1067,6 +1195,12 @@ export async function runAgent(
       narrowing,
       readmitToolNames,
     });
+  }
+
+  // From here the child's tool set is settled enough to judge: rebuild once with the view on.
+  if (promptView) {
+    promptView.track(session);
+    session.setActiveToolsByName(session.getActiveToolNames());
   }
 
   options.onSessionCreated?.(session);

@@ -62,6 +62,10 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     getExtensions() {
       return loaderExtensionsRef.current;
     }
+
+    getSystemPrompt() {
+      return this.opts.systemPromptOverride?.(undefined);
+    }
   },
   getAgentDir,
   SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate, open: sessionManagerOpen },
@@ -314,6 +318,95 @@ describe("agent-runner final output capture", () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "replace" })); skillsOn();
     await runAgent(parentCtx, "general-purpose", "Do it", { pi });
     expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
+  });
+
+  it("subagents:child-resources skillsCatalog: false leaves every catalog out; skills still load; promptNote is appended", async () => {
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    const catalog = "\n\n<skills>\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n    <location>/skills/a/SKILL.md</location>\n  </skill>\n</available_skills>\n</skills>";
+    const parent = `preamble${catalog}\n\n<cwd>\n/tmp\n</cwd>`;
+    const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
+    const listener = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel !== "subagents:child-resources") return;
+          data.skillsCatalog = false;
+          data.promptNote = "Skills are not listed here:\n use the skills tool.";
+        },
+      },
+    } as any;
+    const append = () => vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    append(); vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true, promptMode: "append" }));
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi: listener });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe("preamble\n\n<cwd>\n/tmp\n</cwd>");
+    const opts = defaultResourceLoaderCtor.mock.lastCall![0];
+    expect(opts.noSkills).toBe(false);
+    const hidden = opts.skillsOverride({ skills: [{ name: "z", filePath: "/x/z/SKILL.md", disableModelInvocation: false }], diagnostics: [] });
+    expect(hidden.skills[0].disableModelInvocation).toBe(true);
+    const prompt = opts.systemPromptOverride(undefined);
+    expect(prompt).not.toContain("<available_skills>");
+    expect(prompt.endsWith("\n\nSkills are not listed here: use the skills tool.")).toBe(true);
+
+    // an agent file with its own skills: list keeps it (preloaded, no catalog either way); the note still applies
+    append(); vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: false, promptMode: "append" }));
+    await runAgent(parentCtx, "general-purpose", "Do it", { pi: listener });
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
+  });
+
+  it("an append-mode child's prompt drops the tool lines and rule bullets of parent tools it does not have", async () => {
+    const parent = [
+      "You are pi.",
+      "",
+      "<tools>",
+      "- read: Read files",
+      "- plan: show plans",
+      "- mcp_tool: an MCP tool",
+      "</tools>",
+      "",
+      "<rules>",
+      "- Keep a plan for 3+ steps",
+      "- Call mcp_tool for MCP",
+      "- Be concise in your responses",
+      "</rules>",
+    ].join("\n");
+    const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
+    const parentPi = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel === "subagents:child-resources") data.excludeTools.push("plan");
+        },
+      },
+      getAllTools: () => [
+        { name: "read", promptGuidelines: [] },
+        { name: "plan", promptGuidelines: ["Keep a plan for 3+ steps"] },
+        { name: "mcp_tool", promptGuidelines: ["Call mcp_tool for MCP"] },
+      ],
+    } as any;
+    withExtensions({ "/ext/plan.ts": ["plan"], "/ext/mcp.ts": ["mcp_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ promptMode: "append" }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    // the real append-mode builder puts the parent prompt first; the mock here passes it through
+    vi.mocked(buildAgentPrompt).mockImplementationOnce((_c, _cwd, _env, inherited) => inherited ?? "");
+    await runAgent(parentCtx, "general-purpose", "go", { pi: parentPi });
+
+    const view = createAgentSession.mock.calls[0][0].resourceLoader;
+    const seen = view.getSystemPrompt();
+    expect(seen).toContain("- read: Read files");
+    expect(seen).toContain("- mcp_tool: an MCP tool");
+    expect(seen).toContain("- Call mcp_tool for MCP");
+    expect(seen).not.toContain("- plan: show plans");
+    expect(seen).not.toContain("Keep a plan");
+    expect(seen).toContain("- Be concise in your responses");
+    // the session rebuilt its prompt once the view was on
+    expect(session.setActiveToolsByName).toHaveBeenCalled();
+    // the view reads everything else straight through
+    expect(view.getExtensions()).toBe(loaderExtensionsRef.current);
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {
@@ -2228,6 +2321,105 @@ describe("agent-runner exclude_extensions", () => {
     expect(extensionErrors(onToolActivity)).toEqual([
       expect.stringContaining("extension-error:ext:beta"),
     ]);
+  });
+
+  it("subagents:child-resources listener trims an inheriting child; an agent file's own excludes win", async () => {
+    const heard: Array<{ type: string }> = [];
+    const piWithListener = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel !== "subagents:child-resources") return;
+          heard.push({ type: data.type });
+          data.excludeExtensions.push("notify", "not-installed-here");
+        },
+      },
+    } as any;
+    withExtensions({
+      "/ext/notify.ts": ["notify_send"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    setupAgent({ extensions: true });
+    await runAgent(ctx, "general-purpose", "go", { pi: piWithListener, onToolActivity });
+    expect(heard).toEqual([{ type: "general-purpose" }]);
+    expect(lastToolsPassed()).not.toContain("notify_send");
+    expect(lastToolsPassed()).toContain("mcp_tool");
+    // A listener's name for an extension this machine lacks is not a typo.
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+
+    // An agent file that sets exclude_extensions: itself keeps its own list: the listener's is ignored.
+    createAgentSession.mockClear();
+    defaultResourceLoaderCtor.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    withExtensions({
+      "/ext/notify.ts": ["notify_send"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    setupAgent({ extensions: true, excludeExtensions: ["mcp"] });
+    await runAgent(ctx, "general-purpose", "go", { pi: piWithListener });
+    expect(heard).toHaveLength(2);
+    expect(lastToolsPassed()).toContain("notify_send");
+    expect(lastToolsPassed()).not.toContain("mcp_tool");
+  });
+
+  it("subagents:child-resources excludeTools drops tools, but never one the agent file names itself", async () => {
+    const piWithListener = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel === "subagents:child-resources") data.excludeTools.push("ask_user", "pin_widget", "plan");
+        },
+      },
+    } as any;
+    withExtensions({
+      "/ext/ui.ts": ["ask_user", "pin_widget"],
+      "/ext/plan.ts": ["plan"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    setupAgent({ extensions: true, disallowedTools: ["mcp_tool"] });
+    await runAgent(ctx, "general-purpose", "go", { pi: piWithListener });
+    expect(lastToolsPassed()).not.toContain("ask_user");
+    expect(lastToolsPassed()).not.toContain("pin_widget");
+    expect(lastToolsPassed()).not.toContain("plan");
+    // the agent file's own disallowed_tools still apply alongside the listener's
+    expect(lastToolsPassed()).not.toContain("mcp_tool");
+    expect(createAgentSession.mock.calls[0][0].excludeTools).toEqual(expect.arrayContaining(["ask_user", "pin_widget", "plan", "mcp_tool"]));
+
+    // ext:plan/plan in the agent file's tools: keeps plan
+    createAgentSession.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    withExtensions({
+      "/ext/ui.ts": ["ask_user", "pin_widget"],
+      "/ext/plan.ts": ["plan"],
+    });
+    setupAgent({ extensions: true, extSelectors: ["ext:plan/plan", "ext:ui"] });
+    await runAgent(ctx, "general-purpose", "go", { pi: piWithListener });
+    expect(lastToolsPassed()).toContain("plan");
+    expect(lastToolsPassed()).not.toContain("ask_user");
+
+    // a built-in the agent only has by default goes; one its tools: names stays
+    const dropBash = { events: { emit(channel: string, data: any) { if (channel === "subagents:child-resources") data.excludeTools.push("bash"); } } } as any;
+    createAgentSession.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    setupAgent({ extensions: true });
+    await runAgent(ctx, "general-purpose", "go", { pi: dropBash });
+    expect(createAgentSession.mock.calls[0][0].excludeTools).toContain("bash");
+    createAgentSession.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    setupAgent({ extensions: true, namedToolNames: ["read", "bash"] });
+    await runAgent(ctx, "general-purpose", "go", { pi: dropBash });
+    expect(createAgentSession.mock.calls[0][0].excludeTools).not.toContain("bash");
+
+    // isolated: the listener is not asked
+    createAgentSession.mockClear();
+    const emit = vi.fn();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    setupAgent({ extensions: true });
+    await runAgent(ctx, "general-purpose", "go", { pi: { events: { emit } } as any, isolated: true });
+    expect(emit).not.toHaveBeenCalled();
   });
 
   it("exclude matches case-insensitively", async () => {

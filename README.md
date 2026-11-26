@@ -747,6 +747,22 @@ The four agent-lifecycle events — `subagents:started`, `:completed`, `:failed`
 
 `usage` answers the other question — what was billed — and so does include `cacheRead`, because the prefix really is re-read and re-charged on every call. It is a pi `Usage`, the same shape pi puts on `ToolResultEvent` and `AssistantMessage`, so `usage.cost.total` is where a listener already expects the money and anything pi adds to `Usage` arrives without a change here. Neither field derives from the other; `tokens` is a view model, `usage` is the data.
 
+### Trimming what a child gets: `subagents:child-resources`
+
+Before each spawn that is not `isolated`, pi-subagents emits `subagents:child-resources` on the parent's `pi.events` with a payload that listeners change in place. `emit` runs listeners synchronously, so their answer is read as soon as it returns. With no listener, nothing changes.
+
+| Field | Default | What a listener sets | Applied when |
+|-------|---------|----------------------|--------------|
+| `type` | the agent type | read only | — |
+| `excludeExtensions` | `[]` | extension names, matched as `exclude_extensions:` entries are | the agent inherits every extension (`extensions: true`, no `exclude_extensions:`) |
+| `excludeTools` | `[]` | tool names, dropped as `disallowed_tools:` entries are | always, except a tool the agent file names itself (`tools:` built-ins, `ext:ext/tool`) |
+| `skillsCatalog` | `true` | `false`: no skills catalog in the child's prompt, neither the inherited copy nor its own; skills still load, so `/skill:name` and a `skills: [names]` preload work | the agent inherits every skill (`skills: true`) |
+| `promptNote` | — | one line appended to the child's prompt (whitespace folded, at most 500 characters) | always |
+
+A nested child (an agent with `allowed_subagents` spawning its own) is asked on the top-level session's bus as well: the top-level session's listeners decide for the whole tree, since a child loads its extensions from the same packages.
+
+Separately, an append-mode child no longer reads the parent's tool lines and rule bullets for tools it does not have: the inherited `<tools>` lines (or "Available tools:") and the `<rules>` bullets (or "Guidelines:") contributed only by parent tools missing from the child's active set are dropped, judged again whenever the child's active tools change. Rule bullets are attributed through each tool's `promptGuidelines`; pi's own rules and lines naming no parent tool stay.
+
 ## Cross-Extension RPC
 
 Other pi extensions can spawn and stop subagents programmatically via the `pi.events` event bus, without importing this package directly.

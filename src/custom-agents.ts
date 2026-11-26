@@ -102,7 +102,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
     // filename-derived one down with it.
     const name = declared || filenameType;
 
-    const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
+    const { builtinToolNames, extSelectors, namedToolNames } = parseToolsField(fm.tools);
 
     agents.set(name, {
       name,
@@ -113,6 +113,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       color: str(fm.color),
       description: str(fm.description) ?? name,
       builtinToolNames,
+      namedToolNames,
       extSelectors,
       disallowedTools: csvListOptional(fm.disallowed_tools),
       extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
@@ -265,7 +266,7 @@ function csvList(val: unknown, defaults: string[]): string[] {
  * selectors parsed later by the runner. omitted → all built-ins, no selectors.
  * `tools:` present with only `ext:` entries → zero built-ins (use `*`).
  */
-function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelectors: string[] | undefined } {
+function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelectors: string[] | undefined; namedToolNames: string[] } {
   const entries = csvList(val, BUILTIN_TOOL_NAMES);
   const isWildcard = (e: string) => e === "*" || e.toLowerCase() === "all";
   const hasWildcard = entries.some(isWildcard);
@@ -274,6 +275,8 @@ function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelecto
   return {
     builtinToolNames: hasWildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,
     extSelectors: extEntries.length > 0 ? extEntries : undefined,
+    // only what the file wrote: an omitted `tools:` resolves to every built-in above, but names none
+    namedToolNames: val === undefined || val === null ? [] : plain,
   };
 }
 
