@@ -322,6 +322,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       return toSpawnResult(record);
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      // Its session was shut down at settle (fork, #4): let go of the follower that would keep it reachable.
+      try { deps.onChildSettled?.(id); } catch { /* observers never break a run */ }
     }
   }
 

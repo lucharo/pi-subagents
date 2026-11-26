@@ -512,6 +512,12 @@ export class AgentManager {
   private reopenArgs = new Map<string, SpawnArgs>();
 
   /**
+   * The branch a reopened isolated workflow child last started from (fork, #14), by record id. A continuation that
+   * changes nothing saves no branch of its own, so the next one starts from this one again rather than from HEAD.
+   */
+  private reopenedFrom = new Map<string, string>();
+
+  /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
    * both pools: `drainQueue` picks the earliest entry whose own pool has room,
    * so neither can head-of-line-block the other, and every removal path
@@ -966,6 +972,7 @@ export class AgentManager {
         } else {
           this.agents.delete(id);
           this.reopenArgs.delete(id);
+          this.reopenedFrom.delete(id);
         }
         // The agent never kept its slot (startAgent gives it back on failure),
         // so anything queued behind it can go now.
@@ -1244,7 +1251,9 @@ export class AgentManager {
           record.sessionFile ??= session?.sessionManager?.getSessionFile?.();
         }
 
-        detach();
+        // A late ending's caller wiring went with the stall check's settle; the
+        // record's current listener may be a newer invocation's.
+        if (!late()) detach();
 
         // Final flush of streaming output file
         if (record.outputCleanup && !late()) {
@@ -1291,10 +1300,11 @@ export class AgentManager {
         if (record.status !== "stopped" && !late) {
           record.status = "error";
         }
-        if (!late) record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt ??= Date.now();
-
-        detach();
+        if (!late) {
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt ??= Date.now();
+          detach();
+        }
 
         // Final flush of streaming output file on error
         if (record.outputCleanup && !watch.settled) {
@@ -1426,6 +1436,10 @@ export class AgentManager {
     record.worktree = undefined;
     record.promise = undefined;
     record.abortController = new AbortController();
+    // An isolated child continues from the branch its latest changes were saved to, so the work it remembers doing
+    // is in its tree: its last run's branch, or, when that run changed nothing, the one that run started from.
+    const from = record.worktreeResult?.hasChanges ? record.worktreeResult.branch : this.reopenedFrom.get(id);
+    if (from !== undefined) this.reopenedFrom.set(id, from);
     const args: SpawnArgs = {
       ...base,
       prompt,
@@ -1433,9 +1447,7 @@ export class AgentManager {
         ...base.options,
         resumeSessionFile: record.sessionFile,
         reopenInPlace: true,
-        // An isolated child continues from the branch its last run's changes
-        // were saved to, so the work it remembers doing is in its tree.
-        worktreeFrom: record.worktreeResult?.hasChanges ? record.worktreeResult.branch : undefined,
+        worktreeFrom: from,
         signal,
         invocation: record.invocation,
         // The first run's hooks belong to its own call: its spawn callbacks, its
@@ -2121,6 +2133,7 @@ export class AgentManager {
     }
     this.watches.delete(id);
     this.reopenArgs.delete(id);
+    this.reopenedFrom.delete(id);
     this.tombstone(record);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
@@ -2345,6 +2358,7 @@ export class AgentManager {
     this.agents.clear();
     this.startups.clear();
     this.reopenArgs.clear();
+    this.reopenedFrom.clear();
     for (const watch of this.watches.values()) watch.off?.();
     this.watches.clear();
     if (pi) {

@@ -211,6 +211,73 @@ describe("a settled workflow child keeps its record, not its session (#4)", () =
     expect(vi.mocked(cleanupWorktree).mock.calls.map(c => c[2].path)).toEqual(["/wt/first", "/wt/second"]);
   });
 
+  it("a stopped run that fails after its resume leaves the resumed turn's cancellation wired", async () => {
+    let failFirst!: (e: Error) => void;
+    let endSecond!: () => void;
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, prompt: string, options: any) => {
+      const session = childSession();
+      sessions.push(session);
+      options.onSessionCreated?.(session);
+      if (!options.resumeSessionFile) await new Promise<void>((_resolve, reject) => { failFirst = reject; });
+      else await new Promise<void>(resolve => { endSecond = resolve; });
+      return { responseText: `done: ${prompt}`, session, aborted: false, steered: false } as any;
+    });
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    const first = host.spawnAgent(request("wf-agent-0"));
+    await vi.waitFor(() => expect(sessions).toHaveLength(1));
+    const record = manager.listAgents()[0];
+    manager.abort(record.id);
+    manager.reapStalled(Date.now() + 60_000); // past the stop's grace: settled from outside
+    await first;
+
+    const caller = new AbortController();
+    const resumed = manager.resume(record.id, "go on", caller.signal);
+    await vi.waitFor(() => expect(sessions).toHaveLength(2));
+    const resumedCompletedAt = record.completedAt;
+    failFirst(new Error("the first run's late failure"));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(record.completedAt).toBe(resumedCompletedAt);
+
+    caller.abort();
+    expect(record.status).toBe("stopped");
+    endSecond();
+    await resumed;
+  });
+
+  it("a child resumed after eviction is let go of when it settles again", async () => {
+    mockRunAgent();
+    const onChildResume = vi.fn();
+    const onChildSettled = vi.fn();
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1", onChildResume, onChildSettled });
+    await host.spawnAgent(request("wf-agent-0"));
+    const id = manager.listAgents()[0].id;
+    manager.clearCompleted(); // evicted, as the ten-minute sweep does
+    expect(manager.getRecord(id)).toBeUndefined();
+
+    const resumed = await host.resumeAgent("wf-agent-0", "continue");
+
+    expect(resumed.ok).toBe(true);
+    expect(onChildResume).toHaveBeenCalledWith(id, expect.anything());
+    expect(onChildSettled.mock.calls.map(c => c[0])).toEqual([id, id]);
+  });
+
+  it("a resume that changed nothing keeps the next one on the saved branch, not HEAD", async () => {
+    const tree = (path: string) => ({ path, branch: "pi-agent-x", baseSha: "base", workPath: path });
+    vi.mocked(createWorktree)
+      .mockResolvedValueOnce(tree("/wt/first")).mockResolvedValueOnce(tree("/wt/second")).mockResolvedValueOnce(tree("/wt/third"));
+    vi.mocked(cleanupWorktree)
+      .mockResolvedValueOnce({ hasChanges: true, branch: "saved-1" })
+      .mockResolvedValueOnce({ hasChanges: false })
+      .mockResolvedValueOnce({ hasChanges: false });
+    const host = createWorkflowHost({ pi: mockPi, ctx: ctx(), manager, workflowId: "wf-1" });
+    await host.spawnAgent({ ...request("wf-agent-0"), isolation: "worktree" });
+
+    await host.resumeAgent("wf-agent-0", "look again");
+    await host.resumeAgent("wf-agent-0", "and once more");
+
+    expect(vi.mocked(createWorktree).mock.calls.map(c => c[3])).toEqual([undefined, "saved-1", "saved-1"]);
+  });
+
   it("a stopped run that ends after its resume cleans up only its own worktree", async () => {
     const tree = (path: string) => ({ path, branch: "pi-agent-x", baseSha: "base", workPath: path });
     vi.mocked(createWorktree).mockResolvedValueOnce(tree("/wt/first")).mockResolvedValueOnce(tree("/wt/second"));
@@ -333,6 +400,25 @@ describe("the extension lets go of a settled child, and its run can be stopped",
     }
   });
 
+  it("a child resumed after eviction keeps writing the transcript it had", async () => {
+    workflowHandoff.ms = 20;
+    const result = await run(
+      'await agent("first", { label: "a" });\nawait new Promise(r => setTimeout(r, 400));\nreturn await agent("more", { resume: "a" });\n',
+    );
+    const runId = /Task ID: (\S+)/.exec(textOf(result))![1];
+    await vi.waitFor(() => expect(sessions[0]?.dispose).toHaveBeenCalledOnce());
+    // A session switch that is then cancelled sweeps settled records: the child is evicted mid-run.
+    await booted.lifecycle.get("session_before_switch")?.({}, ctx({ cwd: hermetic.dir }));
+    await vi.waitFor(() =>
+      expect(booted.pi.sendMessage.mock.calls.some((c: any[]) =>
+        String(c[0]?.content).includes(runId) && String(c[0]?.content).includes("<status>Done</status>"))).toBe(true),
+      { timeout: 10_000 },
+    );
+    expect(sessions).toHaveLength(2);
+    // Stall watch, tool follower and the `.output` stream, as on the first run.
+    expect(sessions[1].subscribe.mock.calls.length).toBe(sessions[0].subscribe.mock.calls.length);
+  });
+
   it("lets go of a settled child while the run is still going", async () => {
     // The run's own settle drops every follower at the end; a long run needs
     // each one dropped as its child settles.
@@ -375,6 +461,29 @@ describe("the extension lets go of a settled child, and its run can be stopped",
   it("says so for a run id it does not know", async () => {
     const result = await booted.tools.get("SubagentWorkflow").execute("tc-stop", { stop: "wf_nosuchrun" }, undefined, undefined, ctx({ cwd: hermetic.dir }));
     expect(textOf(result)).toMatch(/Workflow not found: wf_nosuchrun/);
+  });
+
+  it("a run stopped by a reload keeps its running child's transcript in the settled snapshot", async () => {
+    workflowHandoff.ms = 20;
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, prompt: string, options: any) => {
+      const session = childSession();
+      sessions.push(session);
+      await new Promise(resolve => setImmediate(resolve));
+      options.onSessionCreated?.(session);
+      await new Promise<void>(resolve => options.signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return { responseText: `stopped: ${prompt}`, session, aborted: true, steered: false } as any;
+    });
+    const started = await run('return await agent("work", { label: "a" });\n');
+    const runId = /Task ID: (\S+)/.exec(textOf(started))![1];
+    await vi.waitFor(() => expect(sessions).toHaveLength(1));
+    // Its session reached the extension: transcript stream and tool follower attached.
+    await vi.waitFor(() => expect(sessions[0].subscribe.mock.calls.length).toBeGreaterThanOrEqual(2));
+
+    await booted.lifecycle.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx({ cwd: hermetic.dir }));
+
+    const settled = () => booted.pi.appendEntry.mock.calls.find((c: any[]) => c[0] === "subagents:workflow-run" && c[1]?.id === runId)?.[1];
+    await vi.waitFor(() => expect(settled()).toBeDefined(), { timeout: 10_000 });
+    expect(settled().agents[0].outputFile).toMatch(/\.output$/);
   });
 
   it("stops a running run when the parent reloads", async () => {

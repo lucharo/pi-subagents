@@ -61,6 +61,25 @@ export function sessionTaskDir(cwd: string, sessionId: string): string {
 }
 
 /**
+ * A workflow run's durable folder, `<agentDir>/subagents/<sessionId>/<runId>/`, created if missing (fork). It holds
+ * the children's `.output` transcripts, `run.json` and `script.js`, which are as private as the task dir's, so the
+ * `subagents` root is made owner-only (0700) the same way, an existing one included: nothing under it is reachable
+ * by another local user whatever the umask gave the files.
+ */
+export function durableRunDir(agentDir: string, sessionId: string, runId: string): string {
+  const root = join(agentDir, "subagents");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(root, 0o700);
+  } catch (err) {
+    if (process.platform !== "win32") throw err;
+  }
+  const dir = join(root, sessionId, runId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/**
  * A finished agent's conversation, read back from disk: its pi session file
  * when it has one, else its `.output` transcript. For readers of an agent
  * whose live session is gone — a workflow child's is shut down when it settles

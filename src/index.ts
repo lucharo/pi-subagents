@@ -10,7 +10,7 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -34,7 +34,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel, setModelAsker, substitutionNote } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, readTranscriptMessages, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { createOutputFilePath, durableRunDir, ensureOutputFile, getOutputTranscriptDefault, readTranscriptMessages, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -1159,8 +1159,13 @@ export default function (pi: ExtensionAPI) {
     clearInterval(workflowStallTimer);
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
-    for (const info of workflowChildren.values()) info.off?.();
-    workflowChildren.clear();
+    // Followers let go now; the cache itself stays until each aborted run has
+    // written its settled snapshot (settleWorkflowSnapshot), which reads the
+    // children's transcript paths and tool calls from it.
+    for (const info of workflowChildren.values()) {
+      info.off?.();
+      info.off = undefined;
+    }
     for (const t of publishTimers.values()) clearTimeout(t);
     publishTimers.clear();
     workflowRuns.clear();
@@ -2334,7 +2339,7 @@ Terse command-style prompts produce shallow, generic work.
       const backgroundResult = (id: string, record: AgentRecord | undefined) => {
         const isQueued = record?.status === "queued";
         return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : reopenOptions ? "resumed from its saved session" : "started"} in background.\n` +
+          `${fallbackNote}${modelNote}Agent ${isQueued ? "queued" : reopenOptions ? "resumed from its saved session" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
           `Description: ${params.description}\n` +
@@ -2772,8 +2777,7 @@ Terse command-style prompts produce shallow, generic work.
     const known = runDirs.get(task.id);
     if (known) return known;
     try {
-      const dir = join(getAgentDir(), "subagents", ctx.sessionManager.getSessionId(), task.id);
-      mkdirSync(dir, { recursive: true });
+      const dir = durableRunDir(getAgentDir(), ctx.sessionManager.getSessionId(), task.id);
       runDirs.set(task.id, dir);
       return dir;
     } catch {
@@ -2834,9 +2838,11 @@ Terse command-style prompts produce shallow, generic work.
    * when the first invocation settled, so both are re-attached from the session's current length.
    */
   function onWorkflowChildResume(ctx: ExtensionContext, task: WorkflowTask, recordId: string, session: any) {
-    const info = workflowChildren.get(recordId) ?? { taskId: task.id, open: new Map(), tools: [] };
+    const info: ChildState = workflowChildren.get(recordId) ?? { taskId: task.id, open: new Map(), tools: [] };
     workflowChildren.set(recordId, info);
     const rec = manager.getRecord(recordId);
+    // A child reopened after eviction is a new record under the same id: it continues the transcript it had.
+    if (rec && !rec.outputFile && info.outputFile) rec.outputFile = info.outputFile;
     if (rec?.outputFile && session) {
       try {
         rec.outputCleanup?.();
@@ -2881,6 +2887,10 @@ Terse command-style prompts produce shallow, generic work.
         writeFileSync(join(dir, "script.js"), task.script, "utf-8");
       }
     } catch { /* best effort */ }
+    // The session has ended: nothing reads this run's children again.
+    if (sessionEnded) {
+      for (const [id, info] of workflowChildren) if (info.taskId === task.id) workflowChildren.delete(id);
+    }
   }
 
   /**

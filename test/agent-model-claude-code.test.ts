@@ -149,6 +149,19 @@ describe("Agent tool — a pinned Claude model on a Claude Code login", () => {
     expect(text.startsWith('Note: "anthropic" has no sign-in here, so this ran on claude-code/claude-opus-4-1.')).toBe(true);
   });
 
+  it("a background call says so too, at the start of its started-in-background result", async () => {
+    pinnedAgent(cwd, "anthropic-vertex/claude-sonnet-4-6");
+    vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
+      const s = session(options.model.provider, options.model.id, "medium");
+      options.onSessionCreated?.(s);
+      return { responseText: "done", session: s, aborted: false, steered: false } as never;
+    });
+    const result = await agentTool().execute("tc-bg", { prompt: "go", description: "d", subagent_type: "pinned", run_in_background: true }, undefined, vi.fn(), ctx());
+    const text = result.content[0].text as string;
+    expect(text.startsWith('Note: no model "anthropic-vertex/claude-sonnet-4-6" is available here, so this ran on claude-code/sonnet')).toBe(true);
+    expect(text).toMatch(/started in background/);
+  });
+
   it("a model that resolves as asked carries no note", async () => {
     const { ranOn, text } = await runPinned("claude-code/opus");
     expect(ranOn).toMatchObject({ provider: "claude-code", id: "opus" });
