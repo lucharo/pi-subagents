@@ -113,9 +113,10 @@ export function resolveAgentInvocationConfig(
    * disagree — a caller who asked for what they got was still honored.
    *
    * `max_turns` is deliberately absent: no surface renders a requested-vs-
-   * effective turn limit, so recording one would be dead data.
+   * effective turn limit, so recording one would be dead data. `model` is too:
+   * an agent file's model is only its default, which the caller's overrides.
    */
-  overridden?: { thinking?: ThinkingLevel; model?: string };
+  overridden?: { thinking?: ThinkingLevel };
 } {
   // Precedence first, collapse second — reversing these loses the veto, since
   // an agent file's "off" only outranks a caller's "worktree" while it is still
@@ -127,14 +128,12 @@ export function resolveAgentInvocationConfig(
     && agentConfig.thinking !== params.thinking
     ? params.thinking as ThinkingLevel
     : undefined;
-  const overriddenModel = agentConfig?.model != null && params.model != null
-    && agentConfig.model !== params.model
-    ? params.model
-    : undefined;
-
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
+    // An agent file's `model:` is its default: a model the caller names wins,
+    // so an agent can pick any model for any type (as workflow `agent()` already
+    // does). The other fields stay locked by the agent file.
+    modelInput: params.model ?? agentConfig?.model,
+    modelFromParams: params.model != null,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
@@ -144,9 +143,7 @@ export function resolveAgentInvocationConfig(
     // Undefined rather than an empty object when nothing was overridden: callers
     // spread this into the invocation snapshot, and an always-present key would
     // put `requestedThinking: undefined` on every record.
-    overridden: overriddenThinking || overriddenModel
-      ? { thinking: overriddenThinking, model: overriddenModel }
-      : undefined,
+    overridden: overriddenThinking ? { thinking: overriddenThinking } : undefined,
   };
 }
 

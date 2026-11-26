@@ -1892,8 +1892,8 @@ Terse command-style prompts produce shallow, generic work.
       // This is the pre-session snapshot — agent-manager overwrites it with the
       // effective values the moment a session reports them.
       const { modelName, modelId } = model ? describeModel(model) : { modelName: undefined, modelId: undefined };
-      // What the caller SPELLED, kept only if it names a different model than the
-      // one that won. Model input is fuzzy — `"haiku"` and
+      // What the caller SPELLED, kept only if it resolved to a different model
+      // (a Claude family stand-in, a provider with no sign-in). Model input is fuzzy — `"haiku"` and
       // `"anthropic/claude-haiku-4-5"` are the same model — so comparing the two
       // strings would disclose an override that never happened. A spelling that
       // resolves to nothing is still worth disclosing: it cannot have taken effect.
@@ -1902,7 +1902,7 @@ Terse command-style prompts produce shallow, generic work.
         const resolvedAsked = resolveModel(asked, ctx.modelRegistry, { prefer: ctx.model?.provider, family: true });
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
-      })(resolvedConfig.overridden?.model);
+      })(resolvedConfig.modelFromParams ? resolvedConfig.modelInput : undefined);
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
