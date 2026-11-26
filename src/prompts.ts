@@ -95,8 +95,8 @@ export interface PromptToolInfo {
  * The inherited parent prompt without the lines that describe tools the child does not have.
  *
  * In append mode a child gets the parent's prompt verbatim, including its tool list and the rule bullets each
- * parent tool contributed. This drops, from the first tool list and the first rules list only (pi 1.x
- * `<tools>`/`<rules>` sections, pi 0.84 "Available tools:"/"Guidelines:"):
+ * parent tool contributed. This drops, from pi's own preamble only (before any `<project_context>`, in the one
+ * rendering it uses: pi 1.x `<tools>`/`<rules>` sections or pi 0.84 "Available tools:"/"Guidelines:"):
  * - a tool line `- name: …` (or `- a / b: …`) when every tool it names is a parent tool the child lacks;
  * - a rule bullet when every parent tool that contributed it (by `promptGuidelines`) is one the child lacks.
  * Lines naming no parent tool, pi's own rules, and anything outside those two lists stay as they are.
@@ -126,17 +126,26 @@ export function stripLackedToolLines(prompt: string, parentTools: PromptToolInfo
     const by = owners.get(text.trim());
     return !!by && by.every(lacks);
   };
-  const lists: Array<[RegExp, (text: string) => boolean]> = [
-    [/(<tools>\n)([\s\S]*?)(\n<\/tools>)/, dropTool],
-    [/(<rules>\n)([\s\S]*?)(\n<\/rules>)/, dropRule],
-    [/(\nAvailable tools:\n)([\s\S]*?)(\n\n)/, dropTool],
-    [/(\nGuidelines:\n)([\s\S]*?)(\n\n)/, dropRule],
-  ];
-  let out = prompt;
+  // Only pi's own preamble, before any project context (AGENTS.md may hold a <tools> block of its own), and only
+  // the rendering that preamble uses.
+  const ctxAt = prompt.search(/(^|\n)<project_context>/);
+  const head = ctxAt === -1 ? prompt : prompt.slice(0, ctxAt);
+  const tail = ctxAt === -1 ? "" : prompt.slice(ctxAt);
+  const tagged = /(^|\n)<tools>\n/.test(head);
+  const lists: Array<[RegExp, (text: string) => boolean]> = tagged
+    ? [
+        [/((?:^|\n)<tools>\n)([\s\S]*?)(\n<\/tools>)/, dropTool],
+        [/((?:^|\n)<rules>\n)([\s\S]*?)(\n<\/rules>)/, dropRule],
+      ]
+    : [
+        [/(\nAvailable tools:\n)([\s\S]*?)(\n\n)/, dropTool],
+        [/(\nGuidelines:\n)([\s\S]*?)(\n\n)/, dropRule],
+      ];
+  let out = head;
   for (const [re, drop] of lists) {
     out = out.replace(re, (_all, open: string, body: string, close: string) => open + filterBullets(body, drop) + close);
   }
-  return out;
+  return out + tail;
 }
 
 /**

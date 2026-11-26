@@ -661,6 +661,14 @@ describe("stripLackedToolLines", () => {
     );
   });
 
+  it("leaves project context alone, even a <tools> block an AGENTS.md writes, in either rendering", () => {
+    const own = "<project_context>\n<tools>\n- plan: how we plan here\n</tools>\n<rules>\n- Keep a plan for 3+ steps\n</rules>\n</project_context>";
+    const legacy = `You are pi.\n\nAvailable tools:\n- read: Read files\n- plan: show plans\n\nGuidelines:\n- Keep a plan for 3+ steps\n- Be concise in your responses\n\nPi documentation\n\n${own}`;
+    expect(stripLackedToolLines(legacy, parentTools, ["read"])).toBe(`You are pi.\n\nAvailable tools:\n- read: Read files\n\nGuidelines:\n- Be concise in your responses\n\nPi documentation\n\n${own}`);
+    const tagged = `pre\n\n<tools>\n- read: Read files\n- plan: show plans\n</tools>\n\n${own}`;
+    expect(stripLackedToolLines(tagged, parentTools, ["read"])).toBe(`pre\n\n<tools>\n- read: Read files\n</tools>\n\n${own}`);
+  });
+
   it("changes nothing when the child has every parent tool", () => {
     const prompt = "<tools>\n- plan: show plans\n</tools>\n\n<rules>\n- Keep a plan for 3+ steps\n</rules>";
     expect(stripLackedToolLines(prompt, parentTools, parentTools.map((t) => t.name))).toBe(prompt);

@@ -127,6 +127,7 @@ You are a security auditor.`);
     expect(agent.name).toBe("auditor");
     expect(agent.description).toBe("Security Auditor");
     expect(agent.builtinToolNames).toEqual(["read", "grep", "find"]);
+    expect(agent.namedToolNames).toEqual(["read", "grep", "find"]);
     expect(agent.model).toBe("anthropic/claude-opus-4-6");
     expect(agent.thinking).toBe("high");
     expect(agent.maxTurns).toBe(30);
@@ -155,6 +156,7 @@ Just a prompt.`);
     expect(agent.color).toBeUndefined();
     expect(agent.description).toBe("minimal"); // defaults to filename
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES); // all tools
+    expect(agent.namedToolNames).toEqual([]); // ...but the file names none
     expect(agent.extensions).toBe(true); // inherit all
     expect(agent.skills).toBe(true); // inherit all
     expect(agent.model).toBeUndefined();

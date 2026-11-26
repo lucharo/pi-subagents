@@ -759,6 +759,8 @@ Before each spawn that is not `isolated`, pi-subagents emits `subagents:child-re
 | `skillsCatalog` | `true` | `false`: no skills catalog in the child's prompt, neither the inherited copy nor its own; skills still load, so `/skill:name` and a `skills: [names]` preload work | the agent inherits every skill (`skills: true`) |
 | `promptNote` | — | one line appended to the child's prompt (whitespace folded, at most 500 characters) | always |
 
+A nested child (an agent with `allowed_subagents` spawning its own) is asked on the top-level session's bus as well: the top-level session's listeners decide for the whole tree, since a child loads its extensions from the same packages.
+
 Separately, an append-mode child no longer reads the parent's tool lines and rule bullets for tools it does not have: the inherited `<tools>` lines (or "Available tools:") and the `<rules>` bullets (or "Guidelines:") contributed only by parent tools missing from the child's active set are dropped, judged again whenever the child's active tools change. Rule bullets are attributed through each tool's `promptGuidelines`; pi's own rules and lines naming no parent tool stay.
 
 ## Cross-Extension RPC

@@ -2400,6 +2400,19 @@ describe("agent-runner exclude_extensions", () => {
     expect(lastToolsPassed()).toContain("plan");
     expect(lastToolsPassed()).not.toContain("ask_user");
 
+    // a built-in the agent only has by default goes; one its tools: names stays
+    const dropBash = { events: { emit(channel: string, data: any) { if (channel === "subagents:child-resources") data.excludeTools.push("bash"); } } } as any;
+    createAgentSession.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    setupAgent({ extensions: true });
+    await runAgent(ctx, "general-purpose", "go", { pi: dropBash });
+    expect(createAgentSession.mock.calls[0][0].excludeTools).toContain("bash");
+    createAgentSession.mockClear();
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    setupAgent({ extensions: true, namedToolNames: ["read", "bash"] });
+    await runAgent(ctx, "general-purpose", "go", { pi: dropBash });
+    expect(createAgentSession.mock.calls[0][0].excludeTools).not.toContain("bash");
+
     // isolated: the listener is not asked
     createAgentSession.mockClear();
     const emit = vi.fn();

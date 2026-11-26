@@ -754,7 +754,7 @@ export async function runAgent(
   // Other extensions may trim what a child loads and reads (see askChildResources).
   // Tools the agent file names itself are never taken away by a listener.
   const ownToolNames = [
-    ...(agentConfig?.builtinToolNames ?? []),
+    ...(agentConfig?.namedToolNames ?? []),
     ...[...parseExtSelectors(agentConfig?.extSelectors ?? []).narrowing.values()].flatMap((set) => [...set]),
   ];
   const hooked = options.isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames);
