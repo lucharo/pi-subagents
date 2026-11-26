@@ -1130,10 +1130,12 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     expect(textOf(result)).toMatch(/started in the background/);
     expect(booted.pi.sendMessage).not.toHaveBeenCalled();
 
-    await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
+    // Settled by a stop rather than a session end, whose notice is dropped with the session.
+    await tools.get("SubagentWorkflow").execute("tc-stop", { stop: startedTaskId(result) }, undefined, undefined, workflowCtx());
     const sent = await awaitNotification(startedTaskId(result));
     expect(sent[0].customType).toBe("subagent-notification");
-    expect(sent[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    expect(sent[1]).toMatchObject({ triggerTurn: true });
   });
 
   /** Wait for the completion notification a background run sends for `taskId`. */
@@ -1240,9 +1242,14 @@ describe("SubagentWorkflow card — redraws while the run goes", () => {
     hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
     booted = makePi();
     subagentsExtension(booted.pi);
+    // These scripts start no agent, so the fork's fail-fast hold would keep the call
+    // for the whole handoff window (or return a run that settles inside it inline).
+    workflowHandoff.ms = 20;
   });
 
+  const handoffMs = workflowHandoff.ms;
   afterEach(async () => {
+    workflowHandoff.ms = handoffMs;
     await flush();
     hermetic.restore();
     vi.restoreAllMocks();

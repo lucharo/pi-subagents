@@ -165,6 +165,17 @@ describe("the inspector opens a workflow agent's conversation", () => {
     { setting: "not-a-mode", atRest: false, afterScroll: true },
   ])("hands pi's fullscreenScrollbar $setting to the fullscreen viewer", async ({ setting, atRest, afterScroll }) => {
     sessionMessages = [{ role: "user", content: Array.from({ length: 100 }, (_, i) => `row-${i}`).join("\n") }];
+    // Kept running, so the viewer reads the live session: a settled child's session is shut down (fork, #4)
+    // and its conversation would come from the short transcript on disk instead.
+    let finish!: () => void;
+    const running = new Promise<void>(resolve => { finish = resolve; });
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      const session = fakeSession();
+      await new Promise(resolve => setImmediate(resolve));
+      opts.onSessionCreated?.(session as any);
+      await running;
+      return { responseText: "child done", session: session as any, aborted: false, steered: false };
+    });
     const { command, pi } = await bootWithChild();
     pi.getSettings.mockReturnValue({ fullscreenScrollbar: setting });
     const ui = overlayCtx("fullscreen");
@@ -184,5 +195,6 @@ describe("the inspector opens a workflow agent's conversation", () => {
 
     ui.overlays[1].close();
     ui.overlays[0].close();
+    finish();
   });
 });

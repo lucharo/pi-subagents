@@ -364,45 +364,6 @@ describe("agent-runner final output capture", () => {
     expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("worktreeBase");
   });
 
-  it("renders no second skills catalog when an append-mode child inherits the parent's", async () => {
-    const { buildAgentPrompt } = await import("../src/prompts.js");
-    const catalog = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n    <location>/skills/a/SKILL.md</location>\n  </skill>\n</available_skills>";
-    const parent = `preamble${catalog}\nCurrent working directory: /tmp`;
-    const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
-    const { session } = createSession("ONCE");
-    createAgentSession.mockResolvedValue({ session });
-    const append = () => vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
-    const skillsOn = () => vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true, promptMode: "append" }));
-
-    // append + skills: true + a parent catalog → the parent's prompt stays as it is; skills still load, hidden from the catalog
-    append(); skillsOn();
-    await runAgent(parentCtx, "general-purpose", "Do it", { pi });
-    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
-    const opts = defaultResourceLoaderCtor.mock.lastCall![0];
-    expect(opts.noSkills).toBe(false);
-    const hidden = opts.skillsOverride({
-      skills: [
-        { name: "a", filePath: "/skills/a/SKILL.md", disableModelInvocation: false },
-        { name: "b", filePath: "/skills/b/SKILL.md", disableModelInvocation: false },
-      ],
-      diagnostics: [],
-    });
-    expect(hidden.skills.map((s: { name: string; disableModelInvocation: boolean }) => [s.name, s.disableModelInvocation])).toEqual([
-      ["a", true],
-      ["b", false],
-    ]);
-
-    // no catalog in the parent prompt → the child's loader supplies one
-    append(); skillsOn();
-    await runAgent({ ...ctx, getSystemPrompt: vi.fn(() => "preamble") }, "general-purpose", "Do it", { pi });
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
-
-    // replace mode never inlines the parent prompt → the child's loader supplies one
-    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "replace" })); skillsOn();
-    await runAgent(parentCtx, "general-purpose", "Do it", { pi });
-    expect(defaultResourceLoaderCtor).toHaveBeenLastCalledWith(expect.objectContaining({ noSkills: false, skillsOverride: undefined }));
-  });
-
   it("subagents:child-resources skillsCatalog: false leaves every catalog out; skills still load; promptNote is appended", async () => {
     const { buildAgentPrompt } = await import("../src/prompts.js");
     const catalog = "\n\n<skills>\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool.\n\n<available_skills>\n  <skill>\n    <name>a</name>\n    <location>/skills/a/SKILL.md</location>\n  </skill>\n</available_skills>\n</skills>";
@@ -422,7 +383,9 @@ describe("agent-runner final output capture", () => {
 
     append(); vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: true, promptMode: "append" }));
     await runAgent(parentCtx, "general-purpose", "Do it", { pi: listener });
-    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe("preamble\n\n<cwd>\n/tmp\n</cwd>");
+    // Handed on as inheritableParentPrompt returns it (mocked to pass through here; it drops the
+    // parent's skills and cwd), with no catalog-specific rewrite of its own.
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
     const opts = defaultResourceLoaderCtor.mock.lastCall![0];
     expect(opts.noSkills).toBe(false);
     const hidden = opts.skillsOverride({ skills: [{ name: "z", filePath: "/x/z/SKILL.md", disableModelInvocation: false }], diagnostics: [] });
@@ -431,10 +394,12 @@ describe("agent-runner final output capture", () => {
     expect(prompt).not.toContain("<available_skills>");
     expect(prompt.endsWith("\n\nSkills are not listed here: use the skills tool.")).toBe(true);
 
-    // an agent file with its own skills: list keeps it (preloaded, no catalog either way); the note still applies
+    // an agent file that does not inherit every skill keeps its own setting: the listener's
+    // skillsCatalog is not applied (no override), though the note still is
     append(); vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ skills: false, promptMode: "append" }));
     await runAgent(parentCtx, "general-purpose", "Do it", { pi: listener });
-    expect(vi.mocked(buildAgentPrompt).mock.lastCall![3]).toBe(parent);
+    expect(defaultResourceLoaderCtor.mock.lastCall![0].skillsOverride).toBeUndefined();
+    expect(defaultResourceLoaderCtor.mock.lastCall![0].systemPromptOverride(undefined).endsWith("use the skills tool.")).toBe(true);
   });
 
   it("an append-mode child's prompt drops the tool lines and rule bullets of parent tools it does not have", async () => {
@@ -575,7 +540,7 @@ describe("agent-runner final output capture", () => {
     const result = await runAgent(ctx, "Explore", "work", { pi, signal: controller.signal });
 
     expect(session.prompt).not.toHaveBeenCalled();
-    expect(result.aborted).toBe(true);
+    expect(result.responseText).toBe("");
   });
 
   it("aborts a run that starts after its stop landed during prompt's preflight", async () => {

@@ -69,6 +69,7 @@ describe("cross-extension RPC", () => {
       expect([...FEATURES]).toEqual([
         "consume", "steer", "get", "list", "owned-lifecycle", "stop-settles", "settling", "notification-pending",
         "workflow-events", "workflow-get", "workflow-list", "workflow-result", "workflow-args", "workflow-logs",
+        "workflow-stop",
       ]);
     });
 
@@ -449,26 +450,26 @@ describe("cross-extension RPC", () => {
 
     it("stops the whole run when no index is given", async () => {
       const stop = vi.fn(() => undefined);
-      registerRpcHandlers({ ...deps, workflows: { stop } });
+      registerRpcHandlers({ ...deps, workflowStop: { stop } });
       expect(await ask({ runId: "wf_abc123" })).toEqual({ success: true });
       expect(stop).toHaveBeenCalledWith("wf_abc123", undefined);
     });
 
     it("stops one agent of the run when an index is given", async () => {
       const stop = vi.fn(() => undefined);
-      registerRpcHandlers({ ...deps, workflows: { stop } });
+      registerRpcHandlers({ ...deps, workflowStop: { stop } });
       expect(await ask({ runId: "wf_abc123", index: 6 })).toEqual({ success: true });
       expect(stop).toHaveBeenCalledWith("wf_abc123", 6);
     });
 
     it("passes the run's refusal back as the error", async () => {
-      registerRpcHandlers({ ...deps, workflows: { stop: () => "Workflow is not running" } });
+      registerRpcHandlers({ ...deps, workflowStop: { stop: () => "Workflow is not running" } });
       expect(await ask({ runId: "wf_abc123" })).toEqual({ success: false, error: "Workflow is not running" });
     });
 
     it("refuses a bad index or a missing run id before touching the run", async () => {
       const stop = vi.fn(() => undefined);
-      registerRpcHandlers({ ...deps, workflows: { stop } });
+      registerRpcHandlers({ ...deps, workflowStop: { stop } });
       expect(await ask({ runId: "wf_abc123", index: 1.5 })).toEqual({ success: false, error: "index must be a non-negative integer" });
       expect(await ask({ runId: "wf_abc123", index: -1 })).toEqual({ success: false, error: "index must be a non-negative integer" });
       expect(await ask({ index: 0 })).toEqual({ success: false, error: "runId is required" });
@@ -481,7 +482,7 @@ describe("cross-extension RPC", () => {
     });
 
     it("unsub stops answering", async () => {
-      const { unsubWorkflowStop } = registerRpcHandlers({ ...deps, workflows: { stop: () => undefined } });
+      const { unsubWorkflowStop } = registerRpcHandlers({ ...deps, workflowStop: { stop: () => undefined } });
       unsubWorkflowStop();
       const reply = vi.fn();
       events.on("subagents:rpc:workflow-stop:reply:req-gone", reply);

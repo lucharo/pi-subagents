@@ -385,10 +385,14 @@ describe("the extension lets go of a settled child, and its run can be stopped",
     // pi's reload emits `session_shutdown` with reason "reload" into the old extension instance.
     await booted.lifecycle.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx({ cwd: hermetic.dir }));
 
+    // The run settles as stopped, and its settled snapshot is published and kept. No
+    // notification follows: the parent session it would go to has ended (upstream drops
+    // a pending notification with the session's outbox).
     await vi.waitFor(() =>
-      expect(booted.pi.sendMessage.mock.calls.some((c: any[]) =>
-        String(c[0]?.content).includes(runId) && String(c[0]?.content).includes("<status>Stopped</status>"))).toBe(true),
+      expect(booted.pi.events.emit.mock.calls.some((c: any[]) =>
+        c[0] === "subagents:workflow" && c[1]?.id === runId && c[1]?.status === "killed")).toBe(true),
       { timeout: 10_000 },
     );
+    expect(booted.pi.appendEntry.mock.calls.some((c: any[]) => c[0] === "subagents:workflow-run" && c[1]?.id === runId)).toBe(true);
   });
 });
