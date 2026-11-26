@@ -49,11 +49,24 @@ export interface ResolveOptions {
   family?: boolean;
 }
 
-/** The Claude family a model name belongs to ("claude-opus-4-7" → "opus"), or
- *  undefined for a name that is not a Claude model. */
+/**
+ * Asks the providers of this Pi for a Claude model by an id their lists may not
+ * carry: Claude Code takes any Claude model id, so pi-claude-code answers with
+ * that exact id on its provider (`models:resolve` on Pi's event bus). Set by the
+ * extension at load; unset, nothing is asked.
+ */
+export type ModelAsker = (q: { id: string; provider?: string; prefer?: string }) => any | undefined;
+let modelAsker: ModelAsker | undefined;
+export function setModelAsker(ask: ModelAsker | undefined): void {
+  modelAsker = ask;
+}
+
+/** The Claude family a model name belongs to ("claude-opus-4-7" → "opus",
+ *  "claude-3-5-haiku-20241022" → "haiku"), or undefined for a name that is not
+ *  a Claude model's. */
 export function claudeFamily(input: string): string | undefined {
   const bare = input.slice(input.indexOf("/") + 1).toLowerCase();
-  return /claude[-_.\s]*(opus|sonnet|haiku)/.exec(bare)?.[1];
+  return /claude[-_.\s\w]*?(opus|sonnet|haiku|fable)(?![a-z])/.exec(bare)?.[1];
 }
 
 /**
@@ -110,6 +123,26 @@ export function resolveModel(
   // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
   const normalize = (s: string) => s.toLowerCase().replace(/\./g, "-");
   const query = normalize(input);
+
+  // 1b. A Claude model by its full id (with a version) is that model: the same
+  // id, or a dated snapshot of it, under any available provider (the named one,
+  // then the preferred one); else a provider that takes any Claude id runs it
+  // (Claude Code, through modelAsker). Only then the fuzzy steps, which would
+  // pick a neighbouring version ("claude-opus-4-1" → claude-opus-4-6).
+  const bareInput = slashIdx === -1 ? input : input.slice(slashIdx + 1);
+  if (options.family && claudeFamily(input) && /\d/.test(bareInput)) {
+    const named = slashIdx === -1 ? undefined : input.slice(0, slashIdx);
+    const asked = normalize(bareInput);
+    const same = all.filter(m => {
+      const id = normalize(m.id);
+      return id === asked || (id.startsWith(`${asked}-`) && /^-\d{8}$/.test(id.slice(asked.length)));
+    });
+    const pick = same.find(m => m.provider === named) ?? same.find(m => m.provider === options.prefer) ?? same[0];
+    const found = pick && registry.find(pick.provider, pick.id);
+    if (found) return found;
+    const asker = modelAsker?.({ id: bareInput, provider: named, prefer: options.prefer });
+    if (asker) return asker;
+  }
 
   // Score each model: prefer exact id match > id contains > name contains > provider+id contains
   let bestMatch: ModelEntry | undefined;

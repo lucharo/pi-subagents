@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { claudeFamily, describeModel, type ModelRegistry, resolveModel, substitutionNote } from "../src/model-resolver.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { claudeFamily, describeModel, type ModelRegistry, resolveModel, setModelAsker, substitutionNote } from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -309,11 +309,46 @@ describe("a Claude model with no sign-in of its own, on a Claude Code login", ()
     expect(substitutionNote("claude-haiku-4-5", { provider: "claude-code", id: "claude-haiku-4-5-20251001" })).toBeUndefined();
     expect(substitutionNote("claude-opus-4", { provider: "claude-code", id: "claude-opus-4-7" })).toMatch(/^Note: no model "claude-opus-4"/);
     expect(claudeFamily("gpt-5.4")).toBeUndefined();
+    expect([claudeFamily("claude-3-5-haiku-20241022"), claudeFamily("claude-fable-5-2"), claudeFamily("anthropic/claude-sonnet-4-6")]).toEqual(["haiku", "fable", "sonnet"]);
   });
 
   it("with no Claude available at all, the family fallback finds nothing either", () => {
     const r = resolveModel("anthropic/claude-opus-4-7", makeRegistry([...ANTHROPIC, ...GPT], GPT), { family: true });
     expect(typeof r).toBe("string");
+  });
+
+  describe("any Claude model by its id, through a provider that takes any (Claude Code)", () => {
+    afterEach(() => setModelAsker(undefined));
+    const LIST = [
+      { id: "opus", name: "Opus 5.5", provider: "claude-code" },
+      { id: "claude-opus-4-6[1m]", name: "Opus 4.6 (1M context)", provider: "claude-code" },
+      { id: "claude-haiku-4-5-20251001", name: "Haiku 4.5", provider: "claude-code" },
+    ];
+
+    it("asks the providers and runs exactly that id, before any neighbouring version", () => {
+      const asked: any[] = [];
+      setModelAsker((q) => { asked.push(q); return { provider: "claude-code", id: q.id, name: q.id }; });
+      // without the asker the fuzzy step picks a neighbour: claude-opus-4-1 → claude-opus-4-6[1m]
+      expect(resolveModel("anthropic/claude-opus-4-1", registry(LIST), { family: true, prefer: "azure-openai-responses" })).toMatchObject({ provider: "claude-code", id: "claude-opus-4-1" });
+      expect(asked).toEqual([{ id: "claude-opus-4-1", provider: "anthropic", prefer: "azure-openai-responses" }]);
+      expect(resolveModel("claude-3-5-haiku-20241022", registry(LIST), { family: true })).toMatchObject({ id: "claude-3-5-haiku-20241022" });
+    });
+
+    it("an id a provider lists (a dated snapshot of it too) is taken without asking", () => {
+      setModelAsker(() => { throw new Error("asked"); });
+      expect(resolveModel("anthropic/claude-haiku-4-5", registry(LIST), { family: true })).toMatchObject({ provider: "claude-code", id: "claude-haiku-4-5-20251001" });
+    });
+
+    it("no answer (no Claude Code login): the steps before this change", () => {
+      setModelAsker(() => undefined);
+      expect(resolveModel("anthropic/claude-opus-4-1", registry(LIST), { family: true })).toMatchObject({ provider: "claude-code", id: "claude-opus-4-6[1m]" });
+    });
+
+    it("only where the caller lets a Claude pin stand in (family), and only for an id with a version", () => {
+      setModelAsker(() => { throw new Error("asked"); });
+      expect(resolveModel("anthropic/claude-opus-4-1", registry(LIST))).toMatchObject({ id: "claude-opus-4-6[1m]" });
+      expect(resolveModel("opus", registry(LIST), { family: true })).toMatchObject({ id: "opus" });
+    });
   });
 
   it("a tie goes to the parent's provider, so a subagent stays on the session's login", () => {

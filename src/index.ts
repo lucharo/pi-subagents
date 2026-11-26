@@ -28,7 +28,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel, substitutionNote } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, setModelAsker, substitutionNote } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, readTranscriptMessages, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -304,6 +304,15 @@ export default function (pi: ExtensionAPI) {
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
   if (inChildSessionContext()) return;
+
+  // A Claude model by an id no provider lists is asked of the providers on the
+  // bus: pi-claude-code answers with that exact id on a Claude Code login, so an
+  // agent can pin any Claude model (`models:resolve`, docs/rpc.md).
+  setModelAsker((q) => {
+    let model: any;
+    pi.events.emit("models:resolve", { ...q, reply: (m: unknown) => { model ??= m; } });
+    return model;
+  });
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(

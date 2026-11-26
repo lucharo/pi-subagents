@@ -17,8 +17,18 @@ import { runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 
-function agentTool() {
+/** `answer`: what a provider on the bus answers a `models:resolve` with (pi-claude-code's part), or nothing */
+function agentTool(answer?: (q: any) => any) {
   const tools = new Map<string, any>();
+  const handlers = new Map<string, ((d: any) => void)[]>();
+  const emit = vi.fn((event: string, data: any) => {
+    for (const f of handlers.get(event) ?? []) f(data);
+  });
+  const on = vi.fn((event: string, f: (d: any) => void) => {
+    handlers.set(event, [...(handlers.get(event) ?? []), f]);
+    return vi.fn();
+  });
+  if (answer) on("models:resolve", (q: any) => { const m = answer(q); if (m) q.reply(m); });
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn(),
@@ -29,7 +39,7 @@ function agentTool() {
     getAllTools: vi.fn(() => [] as any[]),
     setActiveTools: vi.fn(),
     on: vi.fn(),
-    events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
+    events: { emit, on },
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
   } as any;
@@ -102,7 +112,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function runPinned(model: string) {
+async function runPinned(model: string, answer?: (q: any) => any) {
   pinnedAgent(cwd, model);
   let ranOn: any;
   vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
@@ -111,7 +121,7 @@ async function runPinned(model: string) {
     options.onSessionCreated?.(s);
     return { responseText: "done", session: s, aborted: false, steered: false } as never;
   });
-  const result = await agentTool().execute("tc-1", { prompt: "go", description: "d", subagent_type: "pinned", run_in_background: false }, undefined, vi.fn(), ctx());
+  const result = await agentTool(answer).execute("tc-1", { prompt: "go", description: "d", subagent_type: "pinned", run_in_background: false }, undefined, vi.fn(), ctx());
   return { ranOn, text: result.content[0].text as string };
 }
 
@@ -126,6 +136,17 @@ describe("Agent tool — a pinned Claude model on a Claude Code login", () => {
     const { ranOn, text } = await runPinned("google/gemini-2.5-pro");
     expect(ranOn).toMatchObject({ provider: "azure-openai-responses", id: "gpt-5.4" });
     expect(text.startsWith('Note: no model "google/gemini-2.5-pro" is available here, so this ran on the session\'s model, azure-openai-responses/gpt-5.4.')).toBe(true);
+  });
+
+  it("any Claude model id runs as that exact model on the Claude Code login, when Claude Code answers for it", async () => {
+    const asked: any[] = [];
+    const { ranOn, text } = await runPinned("anthropic/claude-opus-4-1", (q) => {
+      asked.push({ id: q.id, provider: q.provider, prefer: q.prefer });
+      return { provider: "claude-code", id: q.id, name: q.id };
+    });
+    expect(asked).toEqual([{ id: "claude-opus-4-1", provider: "anthropic", prefer: "azure-openai-responses" }]);
+    expect(ranOn).toMatchObject({ provider: "claude-code", id: "claude-opus-4-1" });
+    expect(text.startsWith('Note: "anthropic" has no sign-in here, so this ran on claude-code/claude-opus-4-1.')).toBe(true);
   });
 
   it("a model that resolves as asked carries no note", async () => {
