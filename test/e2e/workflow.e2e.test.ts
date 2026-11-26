@@ -21,7 +21,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxText, fauxToolCall, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
@@ -67,6 +67,13 @@ function journalsFor(cwd: string): string[] {
 /** Everything the faux backend was ever asked, flattened for substring checks. */
 const asText = (context: { messages?: unknown[] }) => JSON.stringify(context.messages ?? []);
 
+/**
+ * True once the tool result is in the context. Matched on the result's own
+ * `Task ID: wf_` line, not the bare words: the context also carries the tool
+ * loadout, and the tool's description names the `Task ID` label too.
+ */
+const launched = (context: { messages?: unknown[] }) => asText(context).includes("Task ID: wf_");
+
 /** Poll until `predicate` holds or the deadline passes. */
 async function waitFor(predicate: () => boolean, timeoutMs = 20_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
@@ -94,6 +101,8 @@ describe("Workflow end to end", () => {
     const childPrompts: string[] = [];
     /** System prompts those same subagent calls were given. */
     const childSystemPrompts: string[] = [];
+    /** Every context the parent model was called with, as text. */
+    const parentContexts: string[] = [];
 
     const cwd = workflowProject();
     const run = await runPrintMode({
@@ -102,13 +111,14 @@ describe("Workflow end to end", () => {
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
-          childSystemPrompts.push(context.systemPrompt ?? "");
+          childSystemPrompts.push(getCurrentSystemPrompt(context.messages));
           return fauxText("SUBAGENT-DONE");
         }
-        return asText(context).includes("Task ID")
+        parentContexts.push(asText(context));
+        return launched(context)
           ? fauxText("workflow launched")
           : workflowCall(script);
       },
@@ -137,6 +147,14 @@ describe("Workflow end to end", () => {
       expect(recorded).toHaveLength(2);
       expect(recorded.every(entry => entry.ok && entry.key.length > 0)).toBe(true);
       expect(recorded.map(entry => entry.index)).toEqual([0, 1]);
+
+      // The completion notification is the model's only account of the run, and
+      // its count comes from the runtime's real progress log, which holds an
+      // entry per transition per agent. Counting entries reported "2/10 agents".
+      const notified = await waitFor(() => parentContexts.some(c => c.includes("<task-notification>")));
+      expect(notified, "the parent never received the workflow's completion notification").toBe(true);
+      const notification = parentContexts.find(c => c.includes("<task-notification>")) ?? "";
+      expect(notification).toMatch(/e2e-fanout\\" completed — 2\/2 agents/);
 
       // A workflow child's text is the value `agent()` resolves to, not a
       // report a person reads, and its prompt has to say so — otherwise the
@@ -186,18 +204,18 @@ describe("Workflow end to end", () => {
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           const seen = asText(context);
           childPrompts.push(seen);
           // Answer through the injected tool exactly once, then stop — a model
           // that kept calling it every turn would just spin.
-          const alreadyAnswered = (context.tools ?? []).length > 0 && /Recorded\./.test(seen);
+          const alreadyAnswered = getCurrentTools(context.messages).length > 0 && /Structured output provided successfully/.test(seen);
           return alreadyAnswered
             ? fauxText("done")
             : fauxToolCall("StructuredOutput", { files: ["a.ts", "b.ts"] }, { id: "so-1" });
         }
-        return asText(context).includes("Task ID")
+        return launched(context)
           ? fauxText("workflow launched")
           : fauxToolCall("SubagentWorkflow", { name: "parent" }, { id: "wf-call-named" });
       },
@@ -234,7 +252,7 @@ describe("Workflow end to end", () => {
       maxModelCalls: 12,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
           return fauxText("SUBAGENT-DONE");
@@ -291,6 +309,111 @@ const LIVE_SETTLE_TIMEOUT = 150_000;
 
 /** Every journal entry the run left behind, across whatever journals it wrote. */
 const entriesFor = (cwd: string) => journalsFor(cwd).flatMap(path => readJournal(path));
+
+/**
+ * A saved workflow that checks the runtime against a real model. Each check
+ * compares what came back with an answer the script already knows, so a
+ * check cannot pass by the model saying it did; the script returns the
+ * verdict and the test asserts on it. Only behavior a faux backend cannot
+ * stand in for is here — the rest is pinned by the scripted suite above.
+ */
+const SELFTEST_SCRIPT = [
+  'export const meta = { name: "live-selftest", description: "check the runtime against a real model", phases: [{ title: "Checks" }] };',
+  'phase("Checks");',
+  "const checks = {};",
+  "const check = (name, ok, seen) => {",
+  "  checks[name] = ok === true;",
+  '  log(name + ": " + (ok === true ? "ok" : "FAILED, saw " + JSON.stringify(seen)));',
+  "};",
+  "",
+  "// Without a schema, agent() resolves to the child's final text.",
+  'const echo = await agent("Reply with exactly the token SELFTEST_ECHO and nothing else.", { label: "echo" });',
+  'check("text", typeof echo === "string" && /SELFTEST_ECHO/.test(echo), echo);',
+  "",
+  "// With one, to the validated object the child sent through StructuredOutput.",
+  "const picked = await agent(",
+  '  "Which fruit is named in this sentence: the banana is yellow? Answer through the StructuredOutput tool.",',
+  '  { label: "schema", schema: { type: "object", properties: { fruit: { type: "string" } }, required: ["fruit"] } },',
+  ");",
+  'check("schema", picked !== null && typeof picked === "object" && /banana/i.test(String(picked.fruit)), picked);',
+  "",
+  "// Every stage receives (previous result, original item, index).",
+  "const piped = await pipeline(",
+  '  ["alpha", "beta"],',
+  '  item => agent("Reply with exactly the word " + item.toUpperCase() + " and nothing else.", { label: "pipe:" + item }),',
+  "  (previous, item, index) => ({ previous, item, index }),",
+  ");",
+  "check(",
+  '  "pipeline",',
+  '  piped.length === 2 && piped.every((r, i) => r !== null && r.index === i && r.item === ["alpha", "beta"][i]',
+  '    && typeof r.previous === "string" && r.previous.toUpperCase().includes(r.item.toUpperCase())),',
+  "  piped,",
+  ");",
+  "",
+  "// A thunk that throws folds to null; its sibling still answers.",
+  "const fanned = await parallel([",
+  '  () => agent("Reply with exactly the token SELFTEST_PAR and nothing else.", { label: "par" }),',
+  '  async () => { throw new Error("deliberate"); },',
+  "]);",
+  'check("parallel", typeof fanned[0] === "string" && /SELFTEST_PAR/.test(fanned[0]) && fanned[1] === null, fanned);',
+  "",
+  "// A gate that exits 0 keeps the answer; one that exits non-zero makes it null.",
+  'const kept = await agent("Reply with exactly the token SELFTEST_GATE and nothing else.", { label: "gate-pass", gate: "true" });',
+  'const dropped = await agent("Reply with exactly the token SELFTEST_GATE and nothing else.", { label: "gate-fail", gate: "false" });',
+  'check("gate", typeof kept === "string" && /SELFTEST_GATE/.test(kept) && dropped === null, { kept, dropped });',
+  "",
+  "// agentError(label) says why that null happened, and a later success clears it.",
+  'const gateReason = agentError("gate-fail");',
+  'await agent("Reply with exactly the token SELFTEST_CLEAR and nothing else.", { label: "gate-fail" });',
+  'const cleared = agentError("gate-fail");',
+  'check("errors", typeof gateReason === "string" && /gate/i.test(gateReason) && cleared === undefined, { gateReason, cleared });',
+  "",
+  "// resume continues the same child, so it still knows what it was told.",
+  'await agent("Remember the code word PELICAN-42 for later. Reply with exactly STORED.", { label: "memory" });',
+  "const recalled = await agent(",
+  '  "What code word did I ask you to remember? Reply with only the code word.",',
+  '  { label: "memory-recall", resume: "memory" },',
+  ");",
+  'check("resume", /PELICAN-42/i.test(String(recalled)), recalled);',
+  "",
+  "// A nested workflow() gets a copy of its args and returns its own value.",
+  'const doubled = await workflow("live-selftest-child", { n: 21 });',
+  'check("nested", doubled === 42, doubled);',
+  "",
+  "const failed = Object.keys(checks).filter(name => !checks[name]);",
+  "return { passed: failed.length === 0, failed, checks };",
+].join("\n");
+
+const SELFTEST_CHILD_SCRIPT = [
+  'export const meta = { name: "live-selftest-child", description: "double args.n" };',
+  "return args.n * 2;",
+].join("\n");
+
+/** Undo the XML escaping the completion notification applies to its result. */
+const unescapeXml = (text: string) =>
+  text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+
+/**
+ * The `<result>` of the first workflow completion notification the parent
+ * received, or undefined while none has arrived. It carries the script's own
+ * return value.
+ */
+/** Every text part of every message, in order. */
+function messageTexts(session: { messages?: unknown[] }): string[] {
+  return (session.messages ?? []).flatMap(message => {
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") return [content];
+    return Array.isArray(content) ? content.map(part => String((part as { text?: unknown }).text ?? "")) : [];
+  });
+}
+
+function notifiedResult(session: { messages?: unknown[] }): string | undefined {
+  for (const text of messageTexts(session)) {
+    const match = text.includes("<task-notification>") ? text.match(/<result>([\s\S]*?)<\/result>/) : null;
+    if (match) return unescapeXml(match[1]);
+  }
+  return undefined;
+}
 
 describe.runIf(LIVE)("Workflow end to end (live LLM, opt-in)", () => {
   const dirs: string[] = [];
@@ -451,5 +574,52 @@ describe.runIf(LIVE)("Workflow end to end (live LLM, opt-in)", () => {
       expect(String(payload.fruit)).toMatch(/banana/i);
     },
     LIVE_VITEST_TIMEOUT,
+  );
+
+  it(
+    "the runtime self-test passes every check against a real model",
+    async () => {
+      const cwd = liveProject();
+      mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
+      writeFileSync(join(cwd, ".pi", "workflows", "live-selftest.js"), SELFTEST_SCRIPT);
+      writeFileSync(join(cwd, ".pi", "workflows", "live-selftest-child.js"), SELFTEST_CHILD_SCRIPT);
+
+      run = await runPrintMode({
+        prompt:
+          'Use the SubagentWorkflow tool to run the saved workflow called "live-selftest". ' +
+          "Pass it as the `name` parameter — do not write a script of your own. " +
+          "Then tell me the task id it returned.",
+        cwd,
+        // Ten agents back to back, one of them a resumed session.
+        timeoutMs: LIVE_TIMEOUT * 2,
+      });
+
+      expect(toolCallsNamed(run.parentSession, "SubagentWorkflow").some(c => c.name === "live-selftest")).toBe(true);
+      expect(toolResultsNamed(run.parentSession, "SubagentWorkflow").join("\n")).toContain("Task ID");
+
+      // The verdict is the script's own return value, delivered to the parent
+      // in the completion notification.
+      const session = run.parentSession as unknown as { messages?: unknown[] };
+      const arrived = await waitFor(() => notifiedResult(session) !== undefined, LIVE_SETTLE_TIMEOUT * 2);
+      expect(arrived, "no workflow completion notification reached the parent").toBe(true);
+      const raw = notifiedResult(session) as string;
+      let verdict: { passed?: unknown; failed?: unknown; checks?: Record<string, boolean> };
+      try {
+        verdict = JSON.parse(raw);
+      } catch {
+        throw new Error(`the workflow did not return a verdict: ${raw}`);
+      }
+      // Named, so a failure says which check and the run's log line says why.
+      expect(verdict.failed, `checks: ${JSON.stringify(verdict.checks)}`).toEqual([]);
+      expect(Object.keys(verdict.checks ?? {}).sort()).toEqual(
+        ["errors", "gate", "nested", "parallel", "pipeline", "resume", "schema", "text"],
+      );
+      // The run's failures reach the parent without any script code.
+      const notified = messageTexts(session).find(text => text.includes("<task-notification>")) ?? "";
+      expect(notified).toMatch(/<failures>[\s\S]*\[gate-fail\] failed: [\s\S]*<\/failures>/);
+      expect(notified).toMatch(/<failures>[\s\S]*parallel\[1\] failed: deliberate[\s\S]*<\/failures>/);
+      expect(verdict.passed).toBe(true);
+    },
+    LIVE_VITEST_TIMEOUT * 2,
   );
 });

@@ -61,6 +61,25 @@ export function sessionTaskDir(cwd: string, sessionId: string): string {
 }
 
 /**
+ * A workflow run's durable folder, `<agentDir>/subagents/<sessionId>/<runId>/`, created if missing (fork). It holds
+ * the children's `.output` transcripts, `run.json` and `script.js`, which are as private as the task dir's, so the
+ * `subagents` root is made owner-only (0700) the same way, an existing one included: nothing under it is reachable
+ * by another local user whatever the umask gave the files.
+ */
+export function durableRunDir(agentDir: string, sessionId: string, runId: string): string {
+  const root = join(agentDir, "subagents");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(root, 0o700);
+  } catch (err) {
+    if (process.platform !== "win32") throw err;
+  }
+  const dir = join(root, sessionId, runId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/**
  * A finished agent's conversation, read back from disk: its pi session file
  * when it has one, else its `.output` transcript. For readers of an agent
  * whose live session is gone — a workflow child's is shut down when it settles
@@ -134,17 +153,27 @@ export function streamToOutputFile(
   cwd: string,
   startIndex?: number,
 ): () => void {
-  // Index of the first message this stream is responsible for. A spawn writes
-  // messages[0] as the initial prompt entry, so it starts at 1. A resume hands
+  // Index of the first message this stream is responsible for. A resume hands
   // in the session's length as of just before the run: the session already
   // holds every prior turn, and re-emitting those would duplicate history that
-  // is already in the file.
-  let writtenCount = startIndex ?? 1;
+  // is already in the file. A spawn has already written its prompt as the
+  // initial entry, so it starts after the first user message — found on the
+  // first flush, because pi puts a system message ahead of it and adds both
+  // only once the prompt runs.
+  let writtenCount = startIndex;
 
   const flush = () => {
     const messages = session.messages;
+    if (writtenCount === undefined) {
+      const prompt = messages.findIndex((m) => m.role === "user");
+      if (prompt === -1) return;
+      writtenCount = prompt + 1;
+    }
     while (writtenCount < messages.length) {
-      const msg = messages[writtenCount];
+      const msg = messages[writtenCount++];
+      // Pi's prompt and tool-loadout records; a Claude Code transcript has no
+      // such entry.
+      if (msg.role === "system") continue;
       const entry = {
         isSidechain: true,
         agentId,
@@ -156,7 +185,6 @@ export function streamToOutputFile(
       try {
         appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
       } catch { /* ignore write errors */ }
-      writtenCount++;
     }
   };
 

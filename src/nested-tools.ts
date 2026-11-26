@@ -6,12 +6,14 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import {
   buildAgentRegistry,
+  formatAgentTypeList,
   getAgentConfigIn,
   getAvailableTypesIn,
+  getToolDescriptionMode,
   resolveEnabledTypeIn,
   resolveTypeIn,
 } from "./agent-types.js";
@@ -89,7 +91,11 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number }): Promise<AgentRecord | undefined>;
+  /** The children `parentId` owns whose runs have settled. */
+  settledChildren(parentId: string): AgentRecord[];
+  /** Wait for one of `parentId`'s pending children to settle; false at once when none is pending. */
+  waitForChild(parentId: string): Promise<boolean>;
 }
 
 export interface NestedToolContext {
@@ -142,6 +148,31 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   return note ? `Nested agent${note}.\n\n${text}` : text;
 }
 
+/**
+ * `formatRecord` for a result the parent's model is about to read. Marked
+ * consumed once its run has settled, so the runner does not deliver it again
+ * before the parent's run ends. The run, not the status: a child stopped from
+ * the UI says "stopped" at once but gets its final text only when its run
+ * unwinds, and the drain must still deliver that.
+ */
+function readRecord(record: AgentRecord, position: ResultPosition, context: NestedToolContext): string {
+  if (context.manager.settledChildren(context.parentAgentId).includes(record)) record.resultConsumed = true;
+  return formatRecord(record, position);
+}
+
+/**
+ * The turn a parent gets when background children it started have finished
+ * and it never read their results: one message per batch, each child under
+ * its id and description so the parent can tell them apart.
+ */
+export function formatChildCompletions(records: readonly AgentRecord[]): string {
+  const header = records.length === 1
+    ? "A background nested agent you started finished:"
+    : `${records.length} background nested agents you started finished:`;
+  const blocks = records.map(r => `Agent ${r.id} (${r.description}):\n${formatRecord(r, "fetched")}`);
+  return [header, ...blocks].join("\n\n");
+}
+
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
 export function createNestedSubagentTools(context: NestedToolContext): ToolDefinition[] {
   // Agents resolve from a registry built for THIS branch's config root (under
@@ -157,22 +188,35 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     return getAvailableTypesIn(registry).filter(name => allowed === undefined || allowed.has(name));
   };
 
+  const registry = loadRegistry();
+  const available = availableIn(registry);
+  // Same list as the main session's Agent tool (#457); a "custom" description
+  // is written for the main session, so it counts as full here.
+  const typeList = available.length > 0
+    ? formatAgentTypeList(available, name => getAgentConfigIn(registry, name), getToolDescriptionMode() === "compact")
+    : "none";
+
   const agentTool = defineTool({
     name: NESTED_TOOL_NAMES[0],
     label: "Agent",
     description:
       "Launch a child-safe nested subagent for bounded delegated work. " +
-      "Only use agent types allowed by this parent agent; nesting is depth-limited.",
+      "Only use agent types allowed by this parent agent; nesting is depth-limited.\n\n" +
+      `Available agent types and the tools they have access to:\n${typeList}\n\n` +
+      // The runner keeps the parent's run open until its background children
+      // report (`drainChildren` in agent-runner.ts), so the parent must not
+      // hand in an answer that calls them still running.
+      "A background nested agent reports back when it finishes: your run continues with its result before you return, so never report it as still running.",
     parameters: Type.Object({
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
-      subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
+      subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${available.join(", ") || "none"}.` }),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
         Type.Boolean({
-          description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
+          description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true to run it alongside your own work; you receive its result before your run ends.",
         }),
       ),
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
@@ -186,9 +230,13 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        // Frontmatter authoritative, as on the spawn path; the manager falls
+        // back to the limit the child was spawned with, then the default.
+        const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
+          maxTurns: getAgentConfigIn(loadRegistry(), existing.type)?.maxTurns ?? params.max_turns,
+        });
         return resumed
-          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
+          ? textResult(readRecord(resumed, "inline", context), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);
       }
 
@@ -385,7 +433,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         if (record.promise) await abortable(record.promise, signal);
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error");
+      return textResult(readRecord(record, "fetched", context), record.status === "error");
     },
   });
 

@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { MAX_PACKAGE_RESOURCE_BYTES } from "../src/package-resources.js";
 import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
@@ -140,6 +141,22 @@ You are a security auditor.`);
     expect(agent.runInBackground).toBe(true);
     expect(agent.isolated).toBe(true);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
+  });
+
+  it("parses cache_retention: none, short and long; drops inherit and anything else", () => {
+    for (const v of ["none", "short", "long"]) {
+      writeAgent(`cache-${v}`, `---\ncache_retention: ${v}\n---\n\nPrompt.`);
+    }
+    writeAgent("cache-inherit", "---\ncache_retention: inherit\n---\n\nPrompt.");
+    writeAgent("cache-bogus", "---\ncache_retention: 1h\n---\n\nPrompt.");
+
+    const result = loadCustomAgents(tmpDir);
+
+    expect(result.get("cache-none")!.cacheRetention).toBe("none");
+    expect(result.get("cache-short")!.cacheRetention).toBe("short");
+    expect(result.get("cache-long")!.cacheRetention).toBe("long");
+    expect(result.get("cache-inherit")!.cacheRetention).toBeUndefined();
+    expect(result.get("cache-bogus")!.cacheRetention).toBeUndefined();
   });
 
   it("uses sensible defaults when frontmatter is empty", () => {
@@ -1055,6 +1072,79 @@ Good body.`);
     }
   });
 
+  // Claude Code agent files name tools in PascalCase (`Read`, `Glob`), list MCP
+  // tools as bare `mcp__<server>__<tool>`, and deny with `disallowedTools`. Read
+  // literally, such a file got no built-in tools and an ignored denylist (#396).
+  describe("Claude Code tool names", () => {
+    it("maps built-in names case-insensitively and Glob/MultiEdit to their pi names", () => {
+      writeAgent("cc", `---
+tools: Read, Grep, glob, LS, Bash, Edit, MultiEdit, Write, WebFetch
+---
+Prompt.`);
+      const agent = loadCustomAgents(tmpDir).get("cc")!;
+      // WebFetch has no pi built-in: it passes through so runAgent still warns about it.
+      expect(agent.builtinToolNames).toEqual(["read", "grep", "find", "ls", "bash", "edit", "write", "WebFetch"]);
+      expect(agent.mcpToolPatterns).toBeUndefined();
+    });
+
+    it("routes bare mcp__ entries to mcpToolPatterns, not built-ins", () => {
+      writeAgent("cc", `---
+tools: Read, mcp__github__search_code, mcp__radius__*
+---
+Prompt.`);
+      const agent = loadCustomAgents(tmpDir).get("cc")!;
+      expect(agent.builtinToolNames).toEqual(["read"]);
+      expect(agent.mcpToolPatterns).toEqual(["mcp__github__search_code", "mcp__radius__*"]);
+    });
+
+    it("reads a server-level mcp__<server> entry as the whole server, as Claude Code does", () => {
+      writeAgent("cc", `---
+tools: read, mcp__radius, mcp__a__b, mcp__c__*
+---
+Prompt.`);
+      expect(loadCustomAgents(tmpDir).get("cc")!.mcpToolPatterns).toEqual(["mcp__radius__*", "mcp__a__b", "mcp__c__*"]);
+    });
+
+    it("reads Claude Code's disallowedTools key and maps its names", () => {
+      writeAgent("cc", `---
+disallowedTools: Write, Glob
+---
+Prompt.`);
+      expect(loadCustomAgents(tmpDir).get("cc")!.disallowedTools).toEqual(["Write", "write", "Glob", "find"]);
+    });
+
+    it("keeps the exact deny entry next to the built-in it maps to", () => {
+      // An extension tool named `glob` must stay denied, not turn into a deny of `find`.
+      writeAgent("cc", `---
+disallowed_tools: glob, read
+---
+Prompt.`);
+      expect(loadCustomAgents(tmpDir).get("cc")!.disallowedTools).toEqual(["glob", "find", "read"]);
+    });
+
+    it("prefers disallowed_tools when both keys are present", () => {
+      writeAgent("cc", `---
+disallowed_tools: bash
+disallowedTools: write
+---
+Prompt.`);
+      expect(loadCustomAgents(tmpDir).get("cc")!.disallowedTools).toEqual(["bash"]);
+    });
+
+    it("leaves pi-style entries unchanged", () => {
+      writeAgent("pi", `---
+tools: read, grep, ext:foo/bar
+disallowed_tools: write
+---
+Prompt.`);
+      const agent = loadCustomAgents(tmpDir).get("pi")!;
+      expect(agent.builtinToolNames).toEqual(["read", "grep"]);
+      expect(agent.extSelectors).toEqual(["ext:foo/bar"]);
+      expect(agent.mcpToolPatterns).toBeUndefined();
+      expect(agent.disallowedTools).toEqual(["write"]);
+    });
+  });
+
   // `/agents → Eject` writes an AgentConfig back out as frontmatter. That writer
   // and this loader are the two halves of one format, but nothing pinned them
   // together — so a field can serialize to something the loader reads back
@@ -1075,6 +1165,12 @@ Good body.`);
 
     it("preserves an explicitly narrowed tool list", () => {
       expect(roundTrip({ builtinToolNames: ["read", "grep"] }).builtinToolNames).toEqual(["read", "grep"]);
+    });
+
+    it("preserves bare mcp__ entries", () => {
+      const loaded = roundTrip({ builtinToolNames: ["read"], mcpToolPatterns: ["mcp__srv__tool", "mcp__other__*"] });
+      expect(loaded.builtinToolNames).toEqual(["read"]);
+      expect(loaded.mcpToolPatterns).toEqual(["mcp__srv__tool", "mcp__other__*"]);
     });
 
     it("preserves the full built-in set", () => {
@@ -1160,9 +1256,226 @@ Good body.`);
         .toEqual(["Explore", "Plan"]);
     });
 
+    // Eject only ever ran on built-in defaults before package agents became
+    // ejectable, so these three fields had no way to reach the writer. A package
+    // agent can carry all of them, and the ejected copy SHADOWS the package
+    // file — so anything dropped here is silently lost from the running agent.
+    it("preserves ext: selectors alongside the built-in tool list", () => {
+      const loaded = roundTrip({ builtinToolNames: ["read", "grep"], extSelectors: ["ext:mcp/github"] });
+      expect(loaded.builtinToolNames).toEqual(["read", "grep"]);
+      expect(loaded.extSelectors).toEqual(["ext:mcp/github"]);
+    });
+
+    it("preserves ext: selectors when there are no built-ins", () => {
+      // Not `none`: zero built-ins with selectors present means "extension tools
+      // only", which is a wider grant than none and has to survive the trip.
+      const loaded = roundTrip({ builtinToolNames: [], extSelectors: ["ext:mcp/github"] });
+      expect(loaded.builtinToolNames).toEqual([]);
+      expect(loaded.extSelectors).toEqual(["ext:mcp/github"]);
+    });
+
+    it("preserves persist_session in both directions, and session_dir", () => {
+      expect(roundTrip({ persistSession: true, sessionDir: "/tmp/sessions" }))
+        .toMatchObject({ persistSession: true, sessionDir: "/tmp/sessions" });
+      expect(roundTrip({ persistSession: false }).persistSession).toBe(false);
+    });
+
+    it("preserves cache_retention", () => {
+      expect(roundTrip({ cacheRetention: "short" }).cacheRetention).toBe("short");
+    });
+
+    it("preserves a tool-less agent as none, not as the whole toolbox", () => {
+      expect(roundTrip({ builtinToolNames: [] }).builtinToolNames).toEqual([]);
+    });
+
     it("preserves a description containing a colon", () => {
       // Serialized via JSON.stringify precisely so YAML doesn't split on the colon.
       expect(roundTrip({ description: "Scout: find things" }).description).toBe("Scout: find things");
     });
+  });
+});
+
+describe("package-provided agents", () => {
+  let tmpDir: string;
+  let pkgDir: string;
+  let originalHome: string | undefined;
+  let originalAgentDir: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-test-pkg-"));
+    pkgDir = join(tmpDir, "package", "agents");
+    mkdirSync(pkgDir, { recursive: true });
+    originalHome = process.env.HOME;
+    originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = tmpDir;
+    delete process.env.PI_CODING_AGENT_DIR;
+  });
+
+  afterEach(() => {
+    if (originalHome == null) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Write an agent into the fake package directory. */
+  function writePackageAgent(name: string, content: string): string {
+    const path = join(pkgDir, `${name}.md`);
+    writeFileSync(path, content);
+    return path;
+  }
+
+  /** Write an agent into one of the local roots. */
+  function writeLocalAgent(where: ".pi" | ".agents", name: string, content: string) {
+    const dir = join(tmpDir, where, "agents");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${name}.md`), content);
+  }
+
+  /** Load with the package tier pinned, bypassing pi's settings. */
+  function load(strict = false) {
+    return loadCustomAgents(tmpDir, strict, { packageDirs: [pkgDir] });
+  }
+
+  it("registers an agent from a package directory", () => {
+    writePackageAgent("researcher", "---\nname: researcher\ndescription: From a package\n---\nBody.");
+    const agent = load().get("researcher");
+    expect(agent?.description).toBe("From a package");
+    expect(agent?.source).toBe("package");
+    expect(agent?.sourcePath).toBe(join(pkgDir, "researcher.md"));
+  });
+
+  it("registers an individually declared package file", () => {
+    const path = writePackageAgent("solo", "---\nname: solo\ndescription: One file\n---\nBody.");
+    const agents = loadCustomAgents(tmpDir, false, { packageDirs: [], packageFiles: [path] });
+    expect(agents.get("solo")?.source).toBe("package");
+  });
+
+  it("loses the name to a global agent", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    const globalDir = join(tmpDir, ".pi", "agent", "agents");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "reviewer.md"), "---\nname: reviewer\ndescription: global\n---\nG");
+
+    const agent = load().get("reviewer");
+    expect(agent?.description).toBe("global");
+    expect(agent?.source).toBe("global");
+  });
+
+  it("loses the name to a project agent", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    writeLocalAgent(".pi", "reviewer", "---\nname: reviewer\ndescription: project\n---\nJ");
+
+    const agent = load().get("reviewer");
+    expect(agent?.description).toBe("project");
+    expect(agent?.source).toBe("project");
+  });
+
+  it("loses the name to a workspace agent", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    writeLocalAgent(".agents", "reviewer", "---\nname: reviewer\ndescription: workspace\n---\nW");
+
+    expect(load().get("reviewer")?.description).toBe("workspace");
+  });
+
+  it("is disabled by a local stub, which is how /agents turns one off", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    writeLocalAgent(".pi", "reviewer", "---\nenabled: false\n---\n");
+
+    const agent = load().get("reviewer");
+    expect(agent?.enabled).toBe(false);
+    expect(agent?.source).toBe("project");
+  });
+
+  it("keeps a package agent the local roots do not claim", () => {
+    writePackageAgent("pkg-only", "---\nname: pkg-only\ndescription: package\n---\nP");
+    writeLocalAgent(".pi", "other", "---\nname: other\ndescription: project\n---\nJ");
+
+    const agents = load();
+    expect(agents.get("pkg-only")?.source).toBe("package");
+    expect(agents.get("other")?.source).toBe("project");
+  });
+
+  it("skips a package agent file larger than the 1 MB ceiling", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const body = "x".repeat(MAX_PACKAGE_RESOURCE_BYTES + 1);
+      writePackageAgent("huge", `---\nname: huge\ndescription: big\n---\n${body}`);
+      expect(load().has("huge")).toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Skipping package agent"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not apply the size ceiling to the user's own agent files", () => {
+    // The ceiling exists because package files are third-party content read on
+    // every spawn. A local file is the user's own and stays unbounded.
+    const dir = join(tmpDir, ".pi", "agents");
+    mkdirSync(dir, { recursive: true });
+    const body = "x".repeat(MAX_PACKAGE_RESOURCE_BYTES + 1);
+    writeFileSync(join(dir, "huge.md"), `---\nname: huge\ndescription: big\n---\n${body}`);
+    expect(load().get("huge")?.source).toBe("project");
+  });
+
+  it("loads later package directories over earlier ones on a name clash", () => {
+    const second = join(tmpDir, "package-two", "agents");
+    mkdirSync(second, { recursive: true });
+    writePackageAgent("shared", "---\nname: shared\ndescription: first\n---\nA");
+    writeFileSync(join(second, "shared.md"), "---\nname: shared\ndescription: second\n---\nB");
+
+    const agents = loadCustomAgents(tmpDir, false, { packageDirs: [pkgDir, second] });
+    expect(agents.get("shared")?.description).toBe("second");
+  });
+
+  it("does not let strictAgentFiles abort a load over a third-party package file", () => {
+    // Strict mode exists so a checked-in `.pi/agents/` fails loudly rather than
+    // falling through to a same-named agent elsewhere. A file inside an
+    // installed package is not the user's to fix, and throwing here would stop
+    // pi from starting at all over someone else's broken `.md`.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writePackageAgent("broken", "---\nname: [unclosed\n---\nBody.");
+      writePackageAgent("fine", "---\nname: fine\ndescription: ok\n---\nBody.");
+      expect(() => load(true)).not.toThrow();
+      expect(load(true).has("fine")).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still lets strictAgentFiles abort over a local file", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeLocalAgent(".pi", "broken", "---\nname: [unclosed\n---\nBody.");
+      expect(() => load(true)).toThrow(/broken\.md/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("skips a package file a ! manifest entry excluded", () => {
+    const path = writePackageAgent("wip", "---\nname: wip\ndescription: unfinished\n---\nB");
+    writePackageAgent("shipped", "---\nname: shipped\ndescription: ready\n---\nB");
+    const excluded = new Set([realpathSync(path)]);
+    const agents = loadCustomAgents(tmpDir, false, {
+      packageDirs: [pkgDir],
+      packageExcluded: p => excluded.has(realpathSync(p)),
+    });
+    expect(agents.has("shipped")).toBe(true);
+    expect(agents.has("wip")).toBe(false);
+  });
+
+  it("skips an unparseable package file without taking the load down", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writePackageAgent("broken", "---\nname: [unclosed\n---\nBody.");
+      writePackageAgent("fine", "---\nname: fine\ndescription: ok\n---\nBody.");
+      expect(load().has("fine")).toBe(true);
+      expect(load().has("broken")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

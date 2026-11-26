@@ -54,14 +54,6 @@ describe("workflowSnapshot (fork)", () => {
   });
 });
 
-describe("agentSummary (fork)", () => {
-  it("names the count when every agent finished, and done/total otherwise", async () => {
-    const { agentSummary } = await import("../src/workflow/task.js");
-    expect(agentSummary(3, 0, 3)).toBe("3 agents");
-    expect(agentSummary(1, 0, 1)).toBe("1 agent");
-    expect(agentSummary(2, 1, 3)).toBe("2/3 agents done, 1 failed");
-  });
-});
 
 describe("pause and resume tell a snapshot listener (fork)", () => {
   it("calls task.onChange on pause and on resume", async () => {

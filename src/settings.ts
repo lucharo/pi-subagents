@@ -1,12 +1,19 @@
 // Persistence for pi-subagents operational settings.
-// - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, never written here
-// - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
+// - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — machine-wide defaults
+// - Project: <cwd>/.pi/subagents.json — per-project overrides; wins over global on load
+// /agents → Settings writes the scope the page is switched to (Tab). It opens
+// on the project file when the project already has one, and on the global
+// file otherwise — a settings change must not leave a `.pi` directory in every
+// repo the user happens to be in unless they chose Project (#391). Only the
+// keys that changed are merged into the file: the global file is shared by
+// every pi session, and writing a whole snapshot would revert other sessions'
+// changes and freeze built-in defaults into it.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
-import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
+import type { AgentMentionMode, CacheRetentionSetting, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
@@ -33,12 +40,26 @@ export interface SubagentsSettings {
    */
   maxConcurrentForeground?: number;
   /**
+   * Cap on running nested children (outside workflows) — `0` = unlimited,
+   * default 10. A nested spawn over it is refused, not queued, and the parent
+   * is told to do the work itself (#352). Top-level and workflow agents neither
+   * count nor are refused.
+   */
+  maxConcurrentNested?: number;
+  /**
    * 0 = unlimited — the extension's single source of truth for that convention:
    * `normalizeMaxTurns()` in agent-runner.ts treats 0 → `undefined`, and the
    * `/agents` → Settings input prompt explicitly says "0 = unlimited".
    */
   defaultMaxTurns?: number;
   graceTurns?: number;
+  /**
+   * How long a headless parent (`pi -p`, JSON mode) waits, in minutes, for
+   * background agents and workflows after its turn ends before stopping them —
+   * `0` = no limit, the default. Claude Code's equivalent ceiling is 10 minutes
+   * (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`), so `10` matches it.
+   */
+  headlessWaitMinutes?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
@@ -48,9 +69,9 @@ export interface SubagentsSettings {
    * returned its result inline.
    *
    * Top-level only. Nested spawns (a subagent spawning its own) always default
-   * to foreground regardless of this setting — see `nested-tools.ts`, where a
-   * detached child would be killed by `abortOwnedChildren` when its parent
-   * settles, with no notification path to deliver its result.
+   * to foreground regardless of this setting — see `nested-tools.ts`. A
+   * detached nested child reports only to its parent, whose run the runner
+   * holds open until it does (`drainChildren` in `agent-runner.ts`).
    *
    * An explicit `run_in_background` on the call, or in the agent file's
    * frontmatter, overrides this in both directions; the setting only decides
@@ -119,6 +140,18 @@ export interface SubagentsSettings {
    */
   toolDescriptionMode?: ToolDescriptionMode;
   /**
+   * Where the SubagentWorkflow script reference reaches the model. "inline"
+   * (default) puts it in the tool description, where the model cannot skip it.
+   * "skill" saves about 4k tokens every session: one line points at the
+   * bundled `workflow-authoring` skill file by path instead, and the model has
+   * to choose to read it before writing a script — a model that does not
+   * writes the script without the reference. "deferred" keeps the tool out of
+   * the tool spec until pi's `tool_search` loads it, then carries the inline
+   * reference; it needs `tool_search` active. Read once at tool registration;
+   * applies on the next pi session.
+   */
+  workflowToolExposure?: WorkflowToolExposureMode;
+  /**
    * Whether the Claude Code-style FleetView (the navigable main+subagents list
    * rendered below the editor) is shown. Defaults to `true`. Pure-UI: when off,
    * the list never registers and the global key handler never captures input.
@@ -143,8 +176,9 @@ export interface SubagentsSettings {
    */
   agentMentions?: AgentMentionMode;
   /**
-   * Whether subagents persist their pi session by default, so `@handle` can
-   * reopen an agent's conversation long after its in-memory record is gone.
+   * Whether subagents persist their pi session by default, so `@handle`,
+   * `Agent({ resume })` and a workflow's `resume` can reopen an agent's
+   * conversation long after its in-memory record is gone.
    * Defaults to `true`. Per-agent `persist_session:` frontmatter overrides it
    * in both directions. Turning it off restores the previous behaviour, where
    * a handle stops resolving roughly ten minutes after the agent finishes and
@@ -152,6 +186,15 @@ export interface SubagentsSettings {
    * nested under the spawning session in pi's `/resume`.
    */
   rememberAgents?: boolean;
+  /**
+   * Prompt-cache retention for subagent model calls: `none`, `short` (5 min on
+   * Anthropic) or `long` (1 hour). Defaults to `inherit`, which leaves pi's
+   * default — and its `PI_CACHE_RETENTION` environment variable — in charge.
+   * Per-agent `cache_retention:` frontmatter overrides it, and a request that
+   * sets its own retention (compaction passes `none`) keeps it. The parent
+   * session is never affected. Read at spawn.
+   */
+  cacheRetention?: CacheRetentionSetting;
   /**
    * Display mode for the persistent above-editor agent widget:
    *   - `all`: show every agent (foreground + background).
@@ -297,6 +340,41 @@ export interface SubagentsSettings {
    */
   showModel?: boolean;
   /**
+   * Whether agents declared by installed pi packages load, and from which
+   * packages. Defaults to `true`.
+   *
+   *   - `true`  — every package whose `package.json` declares `pi.subagents`
+   *               (or the top-level `pi-subagents` key) contributes its agents.
+   *   - `false` — none do.
+   *   - list    — only packages matching an entry, compared case-insensitively
+   *               against the unscoped short name (`@scope/foo` matches `foo`),
+   *               the full package name, or the settings source string.
+   *
+   * On by default because installing is already the trust decision: pi executes
+   * an installed package's `extensions/` and injects its `skills/` into the
+   * system prompt with no further prompt, so a declared `.md` agent is strictly
+   * less privileged than what the same package already runs. The gate exists for
+   * users who want to narrow that anyway, not as a second install ritual.
+   *
+   * Package agents always load at the *lowest* precedence, below global and
+   * project files, so a same-named local agent silently takes the name back.
+   */
+  packageAgents?: boolean | string[];
+  /**
+   * The same gate for workflow scripts declared by installed pi packages
+   * (`pi.subagents.workflows`). Defaults to `true`.
+   *
+   * Deliberately separate from `packageAgents` rather than folded into it: an
+   * agent is markdown we hand to a model, a workflow is `.js` we execute. Both
+   * still sit below the package's own `extensions/`, which pi runs unsandboxed,
+   * so the default matches — but a user who wants package agents without package
+   * workflow scripts can have that without giving up either wholesale.
+   *
+   * No-op when `workflowsEnabled` is off: the tool is never registered, so there
+   * is nothing to resolve a workflow name against.
+   */
+  packageWorkflows?: boolean | string[];
+  /**
    * How much of the conversation viewer's transcript renders as Markdown.
    * Defaults to `assistant`. Applied live — the viewer's `m` key cycles this
    * same setting, so a choice made in the overlay persists like one made in
@@ -312,13 +390,16 @@ export interface SubagentsSettings {
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
+export type WorkflowToolExposureMode = "skill" | "inline" | "deferred";
 
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
   setMaxConcurrentForeground: (n: number) => void;
+  setMaxConcurrentNested: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
+  setHeadlessWaitMinutes: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
@@ -326,9 +407,11 @@ export interface SettingsAppliers {
   setStrictAgentFiles: (b: boolean) => void;
   setDisableDefaultAgents: (b: boolean) => void;
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
+  setWorkflowToolExposure: (mode: WorkflowToolExposureMode) => void;
   setFleetView: (b: boolean) => void;
   setAgentMentions: (mode: AgentMentionMode) => void;
   setRememberAgents: (b: boolean) => void;
+  setCacheRetention: (v: CacheRetentionSetting) => void;
   setWidgetMode: (mode: WidgetMode) => void;
   setOutputTranscript: (b: boolean) => void;
   setWorktreeIsolation: (b: boolean) => void;
@@ -340,6 +423,8 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
+  setPackageAgents: (gate: boolean | string[]) => void;
+  setPackageWorkflows: (gate: boolean | string[]) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -347,9 +432,11 @@ export type SettingsEmit = (event: string, payload: unknown) => void;
 
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
+const VALID_WORKFLOW_TOOL_EXPOSURE_MODES: ReadonlySet<string> = new Set<WorkflowToolExposureMode>(["skill", "inline", "deferred"]);
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
+const VALID_CACHE_RETENTIONS: ReadonlySet<string> = new Set<CacheRetentionSetting>(["inherit", "none", "short", "long"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -357,51 +444,106 @@ const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>
 const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
+const HEADLESS_WAIT_MINUTES_CEILING = 24 * 60;
 const SUBAGENT_DEPTH_CEILING = 16;
 /** A week: past that, a silent agent is not "slow" in any sense the check is for. */
 const STALE_MINUTES_CEILING = 7 * 24 * 60;
+
+/** The settings typed as whole numbers. */
+export type NumericSettingKey =
+  | "maxConcurrent" | "maxConcurrentForeground" | "maxConcurrentNested"
+  | "defaultMaxTurns" | "graceTurns" | "headlessWaitMinutes" | "maxSubagentDepth";
+
+export interface NumericBounds { min: number; max: number }
+
+/**
+ * The accepted range of each number setting, inclusive. Loading drops a value
+ * outside it, and `/agents` → Settings refuses to type one, so a value the menu
+ * saves always survives a restart. A floor of 0 is where 0 is meaningful:
+ * "unlimited" for the foreground/nested caps and max turns, "nesting off" for depth.
+ */
+export const NUMERIC_SETTING_BOUNDS: Readonly<Record<NumericSettingKey, NumericBounds>> = {
+  maxConcurrent: { min: 1, max: MAX_CONCURRENT_CEILING },
+  maxConcurrentForeground: { min: 0, max: MAX_CONCURRENT_CEILING },
+  maxConcurrentNested: { min: 0, max: MAX_CONCURRENT_CEILING },
+  defaultMaxTurns: { min: 0, max: MAX_TURNS_CEILING },
+  graceTurns: { min: 1, max: GRACE_TURNS_CEILING },
+  headlessWaitMinutes: { min: 0, max: HEADLESS_WAIT_MINUTES_CEILING },
+  maxSubagentDepth: { min: 0, max: SUBAGENT_DEPTH_CEILING },
+};
+
+/** A typed `/agents → Settings` row: its id is the setting it writes. */
+export const isNumericSettingKey = (id: string): id is NumericSettingKey => Object.hasOwn(NUMERIC_SETTING_BOUNDS, id);
+
+/**
+ * The value each setting has when no settings file sets it, as the session
+ * snapshot reports it — `/agents` → Settings resets a row to this once Del has
+ * removed the key from every file. Every key is listed; `undefined` marks one
+ * that is unset by default (fallback = general-purpose, workflows and package
+ * gates on, and workflows still free to yield to another extension's tool).
+ * `test/settings-defaults.test.ts` checks it against a boot with no files.
+ */
+export const SETTING_DEFAULTS: { readonly [K in keyof Required<SubagentsSettings>]: SubagentsSettings[K] } = {
+  maxConcurrent: 10,
+  maxConcurrentForeground: 0,
+  maxConcurrentNested: 10,
+  defaultMaxTurns: 0,
+  graceTurns: 5,
+  headlessWaitMinutes: 0,
+  defaultJoinMode: "smart",
+  backgroundByDefault: true,
+  schedulingEnabled: true,
+  scopeModels: false,
+  strictAgentFiles: false,
+  disableDefaultAgents: false,
+  toolDescriptionMode: "full",
+  workflowToolExposure: "inline",
+  fleetView: true,
+  agentMentions: "model",
+  rememberAgents: true,
+  cacheRetention: "inherit",
+  widgetMode: "background",
+  outputTranscript: true,
+  worktreeIsolation: true,
+  workflowsEnabled: undefined,
+  maxSubagentDepth: 2,
+  staleAgentMinutes: 60,
+  fallbackSubagent: undefined,
+  reportUsage: false,
+  showCost: false,
+  showModel: false,
+  viewerMarkdown: "assistant",
+  packageAgents: undefined,
+  packageWorkflows: undefined,
+};
+
+/**
+ * Normalize a package gate: a boolean passes through, an array is trimmed to its
+ * non-empty string entries, a bare string becomes a one-entry allowlist, and
+ * anything else is dropped.
+ *
+ * The two coercions exist for the same reason: this setting's default is `true`,
+ * so *dropping* a malformed value silently admits every package — the opposite
+ * of what someone narrowing the gate meant. So an array that trims to empty is
+ * kept as `[]` (matching nothing, like `false`) rather than dropped, and
+ * `"my-package"` — the obvious typo for a one-entry list — is read as
+ * `["my-package"]` rather than widened to everything.
+ */
+function sanitizePackageGate(val: unknown): boolean | string[] | undefined {
+  if (typeof val === "boolean") return val;
+  if (typeof val === "string") return val.trim() ? [val.trim()] : [];
+  if (!Array.isArray(val)) return undefined;
+  return val.filter((e): e is string => typeof e === "string").map(e => e.trim()).filter(Boolean);
+}
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
   const r = raw as Record<string, unknown>;
   const out: SubagentsSettings = {};
-  if (
-    Number.isInteger(r.maxConcurrent) &&
-    (r.maxConcurrent as number) >= 1 &&
-    (r.maxConcurrent as number) <= MAX_CONCURRENT_CEILING
-  ) {
-    out.maxConcurrent = r.maxConcurrent as number;
-  }
-  // Floor 0, not 1 like maxConcurrent above: 0 is the documented "unlimited"
-  // value and the default, so dropping it would silently be unrepresentable.
-  if (
-    Number.isInteger(r.maxConcurrentForeground) &&
-    (r.maxConcurrentForeground as number) >= 0 &&
-    (r.maxConcurrentForeground as number) <= MAX_CONCURRENT_CEILING
-  ) {
-    out.maxConcurrentForeground = r.maxConcurrentForeground as number;
-  }
-  if (
-    Number.isInteger(r.defaultMaxTurns) &&
-    (r.defaultMaxTurns as number) >= 0 &&
-    (r.defaultMaxTurns as number) <= MAX_TURNS_CEILING
-  ) {
-    out.defaultMaxTurns = r.defaultMaxTurns as number;
-  }
-  if (
-    Number.isInteger(r.graceTurns) &&
-    (r.graceTurns as number) >= 1 &&
-    (r.graceTurns as number) <= GRACE_TURNS_CEILING
-  ) {
-    out.graceTurns = r.graceTurns as number;
-  }
-  if (
-    Number.isInteger(r.maxSubagentDepth) &&
-    (r.maxSubagentDepth as number) >= 0 &&
-    (r.maxSubagentDepth as number) <= SUBAGENT_DEPTH_CEILING
-  ) {
-    out.maxSubagentDepth = r.maxSubagentDepth as number;
+  for (const [key, { min, max }] of Object.entries(NUMERIC_SETTING_BOUNDS) as [NumericSettingKey, NumericBounds][]) {
+    const v = r[key];
+    if (Number.isInteger(v) && (v as number) >= min && (v as number) <= max) out[key] = v as number;
   }
   // Floor 0: the documented "off" value.
   if (
@@ -432,6 +574,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.toolDescriptionMode === "string" && VALID_TOOL_DESCRIPTION_MODES.has(r.toolDescriptionMode)) {
     out.toolDescriptionMode = r.toolDescriptionMode as ToolDescriptionMode;
   }
+  if (typeof r.workflowToolExposure === "string" && VALID_WORKFLOW_TOOL_EXPOSURE_MODES.has(r.workflowToolExposure)) {
+    out.workflowToolExposure = r.workflowToolExposure as WorkflowToolExposureMode;
+  }
   if (typeof r.fleetView === "boolean") {
     out.fleetView = r.fleetView;
   }
@@ -444,6 +589,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.rememberAgents === "boolean") {
     out.rememberAgents = r.rememberAgents;
+  }
+  if (typeof r.cacheRetention === "string" && VALID_CACHE_RETENTIONS.has(r.cacheRetention)) {
+    out.cacheRetention = r.cacheRetention as CacheRetentionSetting;
   }
   if (typeof r.widgetMode === "string" && VALID_WIDGET_MODES.has(r.widgetMode)) {
     out.widgetMode = r.widgetMode as WidgetMode;
@@ -469,6 +617,10 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
+  const packageAgents = sanitizePackageGate(r.packageAgents);
+  if (packageAgents !== undefined) out.packageAgents = packageAgents;
+  const packageWorkflows = sanitizePackageGate(r.packageWorkflows);
+  if (packageWorkflows !== undefined) out.packageWorkflows = packageWorkflows;
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -506,24 +658,88 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
+/** Which settings file a save wrote: `~/.pi/agent/subagents.json` or `<cwd>/.pi/subagents.json`. */
+export type SettingsScope = "global" | "project";
+
+/** The scope a save targets unless one is chosen: project if its file exists, else global (#391). */
+export function defaultSettingsScope(cwd: string = process.cwd()): SettingsScope {
+  return existsSync(projectPath(cwd)) ? "project" : "global";
+}
+
+/** The file a scope reads and writes. */
+export function settingsFilePath(scope: SettingsScope, cwd: string = process.cwd()): string {
+  return scope === "project" ? projectPath(cwd) : globalPath();
+}
+
 /** Load merged settings: global provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
   return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
 }
 
 /**
- * Write project-local settings. Global is never touched from code.
- * Returns `true` on success, `false` if the write (or mkdir) failed so the
- * caller can surface a warning — persistence isn't fatal but isn't silent.
+ * Which file supplies each key's loaded value: `project` when the project file
+ * sets it (it wins on load), else `global`. A key absent from both is at its
+ * shipped default. Invalid values are dropped before this, as on load.
  */
-export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()): boolean {
-  const path = projectPath(cwd);
+export function settingSources(cwd: string = process.cwd()): Partial<Record<keyof SubagentsSettings, SettingsScope>> {
+  const sources: Partial<Record<keyof SubagentsSettings, SettingsScope>> = {};
+  for (const key of Object.keys(readSettingsFile(globalPath()))) sources[key as keyof SubagentsSettings] = "global";
+  for (const key of Object.keys(readSettingsFile(projectPath(cwd)))) sources[key as keyof SubagentsSettings] = "project";
+  return sources;
+}
+
+/**
+ * The keys whose value differs between two snapshots. A key that became
+ * unset is present with `undefined`, which `saveSettings` reads as "remove".
+ */
+export function changedSettings(previous: SubagentsSettings, next: SubagentsSettings): SubagentsSettings {
+  const changes: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+    const before = (previous as Record<string, unknown>)[key];
+    const after = (next as Record<string, unknown>)[key];
+    if (JSON.stringify(before) !== JSON.stringify(after)) changes[key] = after;
+  }
+  return changes as SubagentsSettings;
+}
+
+/**
+ * Merge changed settings into the file of `scope`, which defaults to
+ * `defaultSettingsScope`: an explicit `project` creates `.pi/subagents.json`
+ * on the first change, the default never does (#391). The target is re-read and
+ * only the given keys are set — or removed, when a key's value is `undefined`
+ * — so other keys in the file, including ones another session wrote, survive.
+ * `applied` is the setting the user just set. It is written too when the file
+ * stores a different value for it: the value may be unchanged in memory (it
+ * was set in the other scope first) while the chosen file still disagrees.
+ * A target that exists but is not a JSON object is left untouched.
+ * Returns the scope written, or `undefined` if the write failed so the caller
+ * can surface a warning — persistence isn't fatal but isn't silent.
+ */
+export function saveSettings(
+  changes: SubagentsSettings,
+  cwd: string = process.cwd(),
+  scope: SettingsScope = defaultSettingsScope(cwd),
+  applied: SubagentsSettings = {},
+): SettingsScope | undefined {
+  const path = settingsFilePath(scope, cwd);
   try {
+    const current: unknown = existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) : {};
+    if (typeof current !== "object" || current === null || Array.isArray(current)) return undefined;
+    const stored = current as Record<string, unknown>;
+    const stale = Object.entries(applied).filter(
+      ([key, value]) => key in stored && JSON.stringify(stored[key]) !== JSON.stringify(value),
+    );
+    const writes = { ...Object.fromEntries(stale), ...changes };
+    // Nothing to write — the file already agrees with what is in effect; don't
+    // rewrite it, or create an empty one.
+    if (Object.keys(writes).length === 0) return scope;
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");
-    return true;
+    // An `undefined` change overrides the file's value and is then dropped by
+    // JSON.stringify — that is how a key is removed.
+    writeFileSync(path, JSON.stringify({ ...stored, ...writes }, null, 2), "utf-8");
+    return scope;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -533,8 +749,10 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.maxConcurrentForeground === "number") {
     appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
   }
+  if (typeof s.maxConcurrentNested === "number") appliers.setMaxConcurrentNested(s.maxConcurrentNested);
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
+  if (typeof s.headlessWaitMinutes === "number") appliers.setHeadlessWaitMinutes(s.headlessWaitMinutes);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.staleAgentMinutes === "number") appliers.setStaleAgentMinutes(s.staleAgentMinutes);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
@@ -545,9 +763,11 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.strictAgentFiles === "boolean") appliers.setStrictAgentFiles(s.strictAgentFiles);
   if (typeof s.disableDefaultAgents === "boolean") appliers.setDisableDefaultAgents(s.disableDefaultAgents);
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);
+  if (s.workflowToolExposure) appliers.setWorkflowToolExposure(s.workflowToolExposure);
   if (typeof s.fleetView === "boolean") appliers.setFleetView(s.fleetView);
   if (s.agentMentions) appliers.setAgentMentions(s.agentMentions);
   if (typeof s.rememberAgents === "boolean") appliers.setRememberAgents(s.rememberAgents);
+  if (s.cacheRetention) appliers.setCacheRetention(s.cacheRetention);
   if (s.widgetMode) appliers.setWidgetMode(s.widgetMode);
   if (typeof s.outputTranscript === "boolean") appliers.setOutputTranscript(s.outputTranscript);
   if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation(s.worktreeIsolation);
@@ -556,6 +776,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
+  if (s.packageAgents !== undefined) appliers.setPackageAgents(s.packageAgents);
+  if (s.packageWorkflows !== undefined) appliers.setPackageWorkflows(s.packageWorkflows);
 }
 
 /**
@@ -565,11 +787,12 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
  */
 export function persistToastFor(
   successMsg: string,
-  persisted: boolean,
+  scope: SettingsScope | undefined,
+  shadowed = false,
 ): { message: string; level: "info" | "warning" } {
-  return persisted
-    ? { message: successMsg, level: "info" }
-    : { message: `${successMsg} (session only; failed to persist)`, level: "warning" };
+  if (!scope) return { message: `${successMsg} (session only; failed to persist)`, level: "warning" };
+  const note = shadowed ? "; project settings override it" : "";
+  return { message: `${successMsg} (saved to ${scope} settings${note})`, level: "info" };
 }
 
 /**
@@ -589,18 +812,29 @@ export function applyAndEmitLoaded(
 }
 
 /**
- * Persist a settings snapshot, emit the `subagents:settings_changed` event
- * (regardless of persist outcome so listeners see the in-memory change), and
- * return the toast the UI should display. Event payload carries the `persisted`
- * flag so listeners can react to write failures.
+ * Persist what changed between the last saved snapshot and the current one,
+ * emit the `subagents:settings_changed` event (regardless of persist outcome
+ * so listeners see the in-memory change), and return the toast the UI should
+ * display plus whether the write landed. Event payload carries the full
+ * snapshot and the same `persisted` flag so listeners can react to failures.
  */
 export function saveAndEmitChanged(
   snapshot: SubagentsSettings,
+  previous: SubagentsSettings,
   successMsg: string,
   emit: SettingsEmit,
   cwd: string = process.cwd(),
-): { message: string; level: "info" | "warning" } {
-  const persisted = saveSettings(snapshot, cwd);
+  target?: SettingsScope,
+  applied: SubagentsSettings = {},
+): { message: string; level: "info" | "warning"; persisted: boolean } {
+  const changes = changedSettings(previous, snapshot);
+  const scope = saveSettings(changes, cwd, target, applied);
+  const persisted = scope !== undefined;
   emit("subagents:settings_changed", { settings: snapshot, persisted });
-  return persistToastFor(successMsg, persisted);
+  // A changed value saved to global that the project file overrides holds only
+  // for this session; say so rather than let the next restart revert it
+  // silently. An unchanged value is already what the next start loads.
+  const project = scope === "global" ? readSettingsFile(projectPath(cwd)) : {};
+  const shadowed = Object.keys(changes).some((key) => key in project);
+  return { ...persistToastFor(successMsg, scope, shadowed), persisted };
 }

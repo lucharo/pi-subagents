@@ -84,3 +84,21 @@ describe("createOutputFilePath", () => {
     expect(statSync(root).mode & 0o777).toBe(0o700);
   });
 });
+
+describe("durableRunDir (fork)", () => {
+  let agentDir: string;
+  beforeEach(() => { agentDir = mkdtempSync(join(realTmpdir(), "subagents-durable-")); });
+  afterEach(() => { rmSync(agentDir, { recursive: true, force: true }); });
+
+  it.skipIf(process.platform === "win32")("makes the subagents root owner-only, an existing one included, and returns the run's folder", async () => {
+    const { durableRunDir } = await import("../src/output-file.js");
+    const root = join(agentDir, "subagents");
+    mkdirSync(root, { recursive: true, mode: 0o755 });
+    chmodSync(root, 0o755);
+    const dir = durableRunDir(agentDir, "s1", "wf_abc123def456");
+    expect(dir).toBe(join(root, "s1", "wf_abc123def456"));
+    expect(existsSync(dir)).toBe(true);
+    expect(statSync(root).mode & 0o777).toBe(0o700);
+    expect(statSync(dir).mode & 0o077).toBe(0);
+  });
+});
