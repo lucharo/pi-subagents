@@ -37,9 +37,72 @@ export function describeModel(
  * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
  * Returns the Model on success, or an error message string on failure.
  */
+export interface ResolveOptions {
+  /** A provider to take on a tie: the parent session's, so a subagent of a
+   *  session on one login (e.g. `claude-code@subscription`) stays on it when
+   *  another provider serves the same model id. */
+  prefer?: string;
+  /** The Claude steps: a Claude model by its full id is that model, asked of
+   *  the providers when none lists it (modelAsker), else the same family's model
+   *  ("claude-opus-4-1" → claude-code/opus). For an agent file's pin, which
+   *  otherwise falls back to the parent's model (only the Agent tool's result
+   *  says what ran), and for a caller's model in the Agent tool. */
+  family?: boolean;
+}
+
+/**
+ * Asks the providers of this Pi for a Claude model by an id their lists may not
+ * carry: Claude Code takes any Claude model id, so pi-claude-code answers with
+ * that exact id on its provider (`models:resolve` on Pi's event bus). Set by the
+ * extension at load; unset, nothing is asked.
+ */
+export type ModelAsker = (q: { id: string; provider?: string; prefer?: string }) => any | undefined;
+let modelAsker: ModelAsker | undefined;
+export function setModelAsker(ask: ModelAsker | undefined): void {
+  modelAsker = ask;
+}
+
+/** The Claude family a model name belongs to ("claude-opus-4-7" → "opus",
+ *  "claude-3-5-haiku-20241022" → "haiku"), or undefined for a name that is not
+ *  a Claude model's. */
+export function claudeFamily(input: string): string | undefined {
+  const bare = input.slice(input.indexOf("/") + 1).toLowerCase();
+  return /claude[-_.\s\w]*?(opus|sonnet|haiku|fable)(?![a-z])/.exec(bare)?.[1];
+}
+
+/**
+ * Why `model` was taken for `input` when it is not what the input names: a
+ * provider the input named has no sign-in here (`anthropic/claude-haiku-4-5`
+ * running on `claude-code/claude-haiku-4-5-20251001`), or no available model
+ * has that id and another of the same Claude family stands in. Undefined when
+ * the input picked the model itself. One line, for the start of a tool result.
+ */
+export function substitutionNote(
+  input: string | undefined,
+  model: { provider: string; id: string } | undefined,
+): string | undefined {
+  if (!input || !model) return undefined;
+  const slash = input.indexOf("/");
+  const asked = (slash === -1 ? input : input.slice(slash + 1)).toLowerCase().replace(/\./g, "-");
+  const id = model.id.toLowerCase().replace(/\./g, "-");
+  const namedOther = slash !== -1 && input.slice(0, slash).toLowerCase() !== model.provider.toLowerCase();
+  // the same model: the same id, or one with a trailing date stamp the other lacks
+  const dated = (a: string, b: string) => a.startsWith(`${b}-`) && /^-\d{8}$/.test(a.slice(b.length));
+  const sameModel = id === asked || dated(id, asked) || dated(asked, id);
+  const family = claudeFamily(input);
+  if (!sameModel && family) {
+    return `Note: no model "${input}" is available here, so this ran on ${model.provider}/${model.id}, the same Claude family (${family}).\n\n`;
+  }
+  if (namedOther) {
+    return `Note: "${input.slice(0, slash)}" has no sign-in here, so this ran on ${model.provider}/${model.id}.\n\n`;
+  }
+  return undefined;
+}
+
 export function resolveModel(
   input: string,
   registry: ModelRegistry,
+  options: ResolveOptions = {},
 ): any | string {
   // Available models (those with auth configured)
   const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
@@ -61,6 +124,26 @@ export function resolveModel(
   // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
   const normalize = (s: string) => s.toLowerCase().replace(/\./g, "-");
   const query = normalize(input);
+
+  // 1b. A Claude model by its full id (with a version) is that model: the same
+  // id, or a dated snapshot of it, under any available provider (the named one,
+  // then the preferred one); else a provider that takes any Claude id runs it
+  // (Claude Code, through modelAsker). Only then the fuzzy steps, which would
+  // pick a neighbouring version ("claude-opus-4-1" → claude-opus-4-6).
+  const bareInput = slashIdx === -1 ? input : input.slice(slashIdx + 1);
+  if (options.family && claudeFamily(input) && /\d/.test(bareInput)) {
+    const named = slashIdx === -1 ? undefined : input.slice(0, slashIdx);
+    const asked = normalize(bareInput);
+    const same = all.filter(m => {
+      const id = normalize(m.id);
+      return id === asked || (id.startsWith(`${asked}-`) && /^-\d{8}$/.test(id.slice(asked.length)));
+    });
+    const pick = same.find(m => m.provider === named) ?? same.find(m => m.provider === options.prefer) ?? same[0];
+    const found = pick && registry.find(pick.provider, pick.id);
+    if (found) return found;
+    const asker = modelAsker?.({ id: bareInput, provider: named, prefer: options.prefer });
+    if (asker) return asker;
+  }
 
   // Score each model: prefer exact id match > id contains > name contains > provider+id contains
   let bestMatch: ModelEntry | undefined;
@@ -89,7 +172,9 @@ export function resolveModel(
       score = 20; // all parts present somewhere
     }
 
-    if (score > bestScore) {
+    // A tie goes to the preferred provider (the parent session's).
+    const preferred = options.prefer && m.provider === options.prefer && bestMatch?.provider !== options.prefer;
+    if (score > bestScore || (score > 0 && score === bestScore && preferred)) {
       bestScore = score;
       bestMatch = m;
     }
@@ -105,8 +190,20 @@ export function resolveModel(
   // named provider is preferred when present; this only kicks in when it isn't,
   // so the same model from another provider beats falling back to "inherit".
   if (slashIdx !== -1) {
-    const bare = resolveModel(input.slice(slashIdx + 1), registry);
+    // (without the Claude steps: step 1b has asked for this id, and the family step runs once, below)
+    const bare = resolveModel(input.slice(slashIdx + 1), registry, { ...options, family: false });
     if (typeof bare !== "string") return bare;
+  }
+
+  // 4. Family fallback: a Claude model no available provider has by that id
+  // (an Anthropic API id on a machine signed in only through Claude Code,
+  // whose list may carry just its aliases) runs on the same family's model
+  // where one is available: "claude-opus-4-7" → claude-code/opus. The caller
+  // says so with substitutionNote.
+  const family = options.family ? claudeFamily(input) : undefined;
+  if (family) {
+    const same = resolveModel(family, registry, options);
+    if (typeof same !== "string") return same;
   }
 
   // 4. No match — list available models
