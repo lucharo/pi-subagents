@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeModel, type ModelRegistry, resolveModel } from "../src/model-resolver.js";
+import { claudeFamily, describeModel, type ModelRegistry, resolveModel, substitutionNote } from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -255,6 +255,70 @@ describe("resolveModel", () => {
       expect(typeof result).toBe("string");
       expect(result).toContain("Model not found");
     });
+  });
+});
+
+// A machine signed in to Claude only through Claude Code (the claude-code
+// provider, which holds no key and so is always available): an agent type
+// pinned to an Anthropic API id still runs on Claude, through that login, and
+// the result says so (thenewcomputer/fluide-plugins#1043).
+describe("a Claude model with no sign-in of its own, on a Claude Code login", () => {
+  const ANTHROPIC = [
+    { id: "claude-opus-4-7", name: "Claude Opus 4.7", provider: "anthropic" },
+    { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "anthropic" },
+    { id: "claude-opus-4-7", name: "Claude Opus 4.7", provider: "anthropic-vertex" },
+  ];
+  // Claude Code's aliases, before its own model list was fetched
+  const ALIASES = [
+    { id: "default", name: "Claude Code default", provider: "claude-code" },
+    { id: "opus", name: "Opus", provider: "claude-code" },
+    { id: "sonnet", name: "Sonnet", provider: "claude-code" },
+    { id: "haiku", name: "Haiku", provider: "claude-code" },
+  ];
+  const GPT = [{ id: "gpt-5.4", name: "GPT-5.4", provider: "azure-openai-responses" }];
+  const registry = (cc: typeof ALIASES) => makeRegistry([...ANTHROPIC, ...cc, ...GPT], [...cc, ...GPT]);
+
+  it("an Anthropic API id runs on the same family through Claude Code, and says so", () => {
+    for (const [input, id] of [["anthropic-vertex/claude-opus-4-7", "opus"], ["claude-opus-4-7", "opus"], ["anthropic/claude-haiku-4-5", "haiku"], ["claude-sonnet-4-6", "sonnet"]]) {
+      const m = resolveModel(input, registry(ALIASES));
+      expect(m, input).toMatchObject({ provider: "claude-code", id });
+      expect(substitutionNote(input, m)).toBe(`Note: no model "${input}" is available here, so this ran on claude-code/${id}, the same Claude family (${claudeFamily(input)}).\n\n`);
+    }
+  });
+
+  it("with Claude Code's own list, the same model by id, saying only that its provider has no sign-in", () => {
+    const LIST = [
+      { id: "opus", name: "Opus 5.5", provider: "claude-code" },
+      { id: "claude-opus-4-7", name: "Opus 4.7", provider: "claude-code" },
+      { id: "claude-haiku-4-5-20251001", name: "Haiku 4.5", provider: "claude-code" },
+    ];
+    const m = resolveModel("anthropic/claude-haiku-4-5", registry(LIST));
+    expect(m).toMatchObject({ provider: "claude-code", id: "claude-haiku-4-5-20251001" });
+    expect(substitutionNote("anthropic/claude-haiku-4-5", m)).toBe('Note: "anthropic" has no sign-in here, so this ran on claude-code/claude-haiku-4-5-20251001.\n\n');
+    expect(resolveModel("claude-opus-4-7", registry(LIST))).toMatchObject({ provider: "claude-code", id: "claude-opus-4-7" });
+  });
+
+  it("a model picked as asked carries no note, and a name that is not Claude's gets no family stand-in", () => {
+    expect(substitutionNote("sonnet", { provider: "claude-code", id: "sonnet" })).toBeUndefined();
+    expect(substitutionNote("anthropic/claude-opus-4-7", { provider: "anthropic", id: "claude-opus-4-7" })).toBeUndefined();
+    expect(substitutionNote(undefined, { provider: "claude-code", id: "opus" })).toBeUndefined();
+    expect(typeof resolveModel("gemini-2.5-pro", registry(ALIASES))).toBe("string");
+    expect(claudeFamily("gpt-5.4")).toBeUndefined();
+  });
+
+  it("with no Claude available at all, the family fallback finds nothing either", () => {
+    const r = resolveModel("anthropic/claude-opus-4-7", makeRegistry([...ANTHROPIC, ...GPT], GPT));
+    expect(typeof r).toBe("string");
+  });
+
+  it("a tie goes to the parent's provider, so a subagent stays on the session's login", () => {
+    const SUB = ALIASES.map(m => ({ ...m, provider: "claude-code@subscription" }));
+    const reg = makeRegistry([...ANTHROPIC, ...ALIASES, ...SUB], [...ALIASES, ...SUB]);
+    expect(resolveModel("claude-opus-4-7", reg)).toMatchObject({ provider: "claude-code", id: "opus" });
+    expect(resolveModel("claude-opus-4-7", reg, { prefer: "claude-code@subscription" })).toMatchObject({ provider: "claude-code@subscription", id: "opus" });
+    expect(resolveModel("sonnet", reg, { prefer: "claude-code@subscription" })).toMatchObject({ provider: "claude-code@subscription", id: "sonnet" });
+    // a provider the input names still wins over the preferred one
+    expect(resolveModel("claude-code/haiku", reg, { prefer: "claude-code@subscription" })).toMatchObject({ provider: "claude-code", id: "haiku" });
   });
 });
 
