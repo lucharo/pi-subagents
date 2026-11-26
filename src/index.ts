@@ -28,7 +28,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, setModelAsker, substitutionNote } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, readTranscriptMessages, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -304,6 +304,15 @@ export default function (pi: ExtensionAPI) {
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
   if (inChildSessionContext()) return;
+
+  // A Claude model by an id no provider lists is asked of the providers on the
+  // bus: pi-claude-code answers with that exact id on a Claude Code login, so an
+  // agent can pin any Claude model (`models:resolve`, docs/rpc.md).
+  setModelAsker((q) => {
+    let model: any;
+    pi.events.emit("models:resolve", { ...q, reply: (m: unknown) => { model ??= m; } });
+    return model;
+  });
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -1828,14 +1837,21 @@ Terse command-style prompts produce shallow, generic work.
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
+      // The parent's provider wins a tie, so a subagent of a session on one
+      // login stays on it; a model taken in place of the one asked for (its
+      // provider has no sign-in here, or only its Claude family is available,
+      // e.g. through Claude Code) is said at the start of the result.
       let model = ctx.model;
+      let modelNote = "";
       if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
+        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry, { prefer: ctx.model?.provider, family: true });
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
+          // config-specified: fall back to the parent's model, and say so
+          if (ctx.model) modelNote = `Note: no model "${resolvedConfig.modelInput}" is available here, so this ran on the session's model, ${ctx.model.provider}/${ctx.model.id}.\n\n`;
         } else {
           model = resolved;
+          modelNote = substitutionNote(resolvedConfig.modelInput, resolved) ?? "";
         }
       }
 
@@ -1876,17 +1892,17 @@ Terse command-style prompts produce shallow, generic work.
       // This is the pre-session snapshot — agent-manager overwrites it with the
       // effective values the moment a session reports them.
       const { modelName, modelId } = model ? describeModel(model) : { modelName: undefined, modelId: undefined };
-      // What the caller SPELLED, kept only if it names a different model than the
-      // one that won. Model input is fuzzy — `"haiku"` and
+      // What the caller SPELLED, kept only if it resolved to a different model
+      // (a Claude family stand-in, a provider with no sign-in). Model input is fuzzy — `"haiku"` and
       // `"anthropic/claude-haiku-4-5"` are the same model — so comparing the two
       // strings would disclose an override that never happened. A spelling that
       // resolves to nothing is still worth disclosing: it cannot have taken effect.
       const askedModel = ((asked: string | undefined) => {
         if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
+        const resolvedAsked = resolveModel(asked, ctx.modelRegistry, { prefer: ctx.model?.provider, family: true });
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
-      })(resolvedConfig.overridden?.model);
+      })(resolvedConfig.modelFromParams ? resolvedConfig.modelInput : undefined);
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
@@ -2130,7 +2146,7 @@ Terse command-style prompts produce shallow, generic work.
 
         const isQueued = record?.status === "queued";
         return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
+          `${fallbackNote}${modelNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
           `Description: ${params.description}\n` +
@@ -2270,7 +2286,7 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+        return textResult(`${fallbackNote}${modelNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -2281,7 +2297,7 @@ Terse command-style prompts produce shallow, generic work.
         if (costText) statsParts.push(costText);
       }
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${fallbackNote}${modelNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
         (record.result?.trim() || "No output."),
         details,
       );
@@ -3218,12 +3234,13 @@ Terse command-style prompts produce shallow, generic work.
   // so they are reachable from tests — this command handler is only registered
   // through `registerCommand`, which every test mocks.
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
+  function getModelLabel(type: string, registry?: ModelRegistry, parentProvider?: string): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
+    // resolved as a spawn resolves the pin (the Claude family step, the parent's login first)
+    const resolved = resolveModel(cfg.model, registry, { prefer: parentProvider, family: true });
     // Configured but unresolvable: the runtime silently falls back to the parent
     // model, so flag it (and the fallback) rather than hiding the config.
     if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
@@ -3328,7 +3345,7 @@ Terse command-style prompts produce shallow, generic work.
     const items: SettingItem[] = allNames.map(name => {
       const cfg = getAgentConfig(name);
       const disabled = cfg?.enabled === false;
-      const model = getModelLabel(name, ctx.modelRegistry);
+      const model = getModelLabel(name, ctx.modelRegistry, ctx.model?.provider);
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,

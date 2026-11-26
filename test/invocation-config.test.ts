@@ -41,8 +41,9 @@ describe("resolveAgentInvocationConfig", () => {
       },
     );
 
-    expect(resolved.modelInput).toBe("provider/config-model");
-    expect(resolved.modelFromParams).toBe(false);
+    // the model is the one field the caller overrides: the agent file's is its default
+    expect(resolved.modelInput).toBe("provider/param-model");
+    expect(resolved.modelFromParams).toBe(true);
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
@@ -156,7 +157,7 @@ describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
       { model: "provider/param-model", thinking: "max" },
     );
 
-    expect(resolved.overridden).toEqual({ thinking: "max", model: "provider/param-model" });
+    expect(resolved.overridden).toEqual({ thinking: "max" });
   });
 
   it("records nothing when the caller got what they asked for", () => {
@@ -188,6 +189,6 @@ describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
       { model: "provider/param-model", thinking: "max" },
     );
 
-    expect(resolved.overridden).toEqual({ thinking: "max", model: undefined });
+    expect(resolved.overridden).toEqual({ thinking: "max" });
   });
 });

@@ -134,6 +134,16 @@ Consumption is not terminal. An `@handle` steer un-consumes the record (`src/ind
 
 One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
 
+## Models this extension asks for
+
+To resolve an agent's Claude model by an id no provider lists (an agent file pinning `claude-opus-4-1`, a caller's `Agent({ model })`), this extension asks the other extensions on `pi.events`:
+
+```ts
+pi.events.emit("models:resolve", { id: "claude-opus-4-1", provider: "anthropic", prefer: "claude-code@subscription", reply(model) {} });
+```
+
+`id` is the bare model id, `provider` the one the input named (if any), `prefer` the parent session's provider. A provider that can run any Claude model id answers once with a `Model` for exactly that id; the first answer wins. thenewcomputer/fluide-plugins' pi-claude-code answers for a Claude Code login (none while that login is known to be signed out). It is asked only after no available provider has the id or a dated snapshot of it, and only for a full id with a version; with no answer, resolution goes on to the fuzzy and Claude-family steps.
+
 ## The manager registry
 
 `globalThis[Symbol.for("pi-subagents:manager")]` (`src/index.ts:649-659`) is a second integration surface — the standard Node cross-package singleton pattern, no bus involved:

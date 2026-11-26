@@ -23,6 +23,7 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { claudeFamily, resolveModel } from "./model-resolver.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, hasSkillsCatalog, hideSkillsListedIn, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -382,6 +383,14 @@ export function resolveDefaultModel(
 
       const found = registry.find(provider, modelId);
       if (found && isAvailable(provider, modelId)) return found;
+    }
+    // A Claude model with no sign-in of its own (an agent file's pin reached by
+    // an RPC spawn or a scheduled fire): the same family where one is available,
+    // the parent's provider first, as the Agent tool resolves it
+    const available = registry.getAvailable?.();
+    if (available && claudeFamily(configModel)) {
+      const same = resolveModel(configModel, { find: (p, id) => registry.find(p, id), getAll: () => available, getAvailable: () => available }, { prefer: parentModel?.provider, family: true });
+      if (typeof same !== "string") return same;
     }
   }
 

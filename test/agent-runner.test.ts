@@ -2807,6 +2807,27 @@ describe("resolveDefaultModel", () => {
     expect(r.find).not.toHaveBeenCalled();
   });
 
+  it("runs a Claude pin with no sign-in of its own on the same family, the parent's login first (an RPC or scheduled spawn)", () => {
+    const cc = { provider: "claude-code", id: "sonnet", name: "Sonnet" } as any;
+    const sub = { provider: "claude-code@subscription", id: "sonnet", name: "Sonnet" } as any;
+    const all = [cc, sub];
+    // a class instance whose find reads `this`, as pi's ModelRegistry does: a detached find would throw
+    class Registry {
+      models = all;
+      find(p: string, id: string) {
+        return this.models.find(m => m.provider === p && m.id === id);
+      }
+      getAvailable() {
+        return this.models;
+      }
+    }
+    const r = new Registry();
+    expect(resolveDefaultModel(parent, r, "anthropic-vertex/claude-sonnet-4-6")).toBe(cc);
+    expect(resolveDefaultModel({ provider: "claude-code@subscription", id: "opus" } as any, r, "anthropic-vertex/claude-sonnet-4-6")).toBe(sub);
+    // not a Claude model: the parent's, as before
+    expect(resolveDefaultModel(parent, r, "openai/gpt-5")).toBe(parent);
+  });
+
   it("returns the parent model when no model is configured", () => {
     expect(resolveDefaultModel(parent, registry([haiku]), undefined)).toBe(parent);
   });
