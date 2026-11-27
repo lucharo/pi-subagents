@@ -938,14 +938,31 @@ export function askChildResources(
   return Object.keys(out).length ? out : undefined;
 }
 
-/** The parent's tools with their rule bullets, read through its `pi.getAllTools()`; [] when unavailable. */
-function readParentTools(pi: unknown): PromptToolInfo[] {
+// The prompt options of each parent's current run, as its before_agent_start handlers left them. Other extensions add
+// rule bullets for a tool there, per run (pi-x-session-messaging's spawn_session tip), which `getAllTools()` never shows.
+// Pi hands every handler the same options object for a run, so the reference kept here sees their later changes too.
+const runPromptOptions = new WeakMap<object, { toolGuidelines?: Record<string, unknown> }>();
+
+/** Remember each run's prompt options on `pi`, so a child spawned during the run can attribute its rule bullets. */
+export function trackRunPromptOptions(pi: Pick<ExtensionAPI, "on">): void {
+  pi.on("before_agent_start", (e) => {
+    const o = e?.systemPromptOptions;
+    if (o && typeof o === "object") runPromptOptions.set(pi, o);
+  });
+}
+
+const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((g): g is string => typeof g === "string") : []);
+
+/** The parent's tools with their rule bullets: each tool's own `promptGuidelines` from `pi.getAllTools()`, plus the
+ * bullets the current run's prompt options add for it; [] when unavailable. */
+export function readParentTools(pi: unknown): PromptToolInfo[] {
   try {
     const all = (pi as { getAllTools?: () => Array<{ name?: unknown; promptGuidelines?: unknown }> } | undefined)?.getAllTools?.();
     if (!Array.isArray(all)) return [];
+    const run = (pi && typeof pi === "object" ? runPromptOptions.get(pi) : undefined)?.toolGuidelines ?? {};
     return all.flatMap((t) =>
       typeof t?.name === "string"
-        ? [{ name: t.name, promptGuidelines: Array.isArray(t.promptGuidelines) ? t.promptGuidelines.filter((g): g is string => typeof g === "string") : [] }]
+        ? [{ name: t.name, promptGuidelines: [...new Set([...strings(t.promptGuidelines), ...strings(run[t.name])])] }]
         : [],
     );
   } catch {

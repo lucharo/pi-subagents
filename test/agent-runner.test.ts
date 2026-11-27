@@ -163,6 +163,8 @@ import {
   setDefaultMaxTurns,
   setGraceTurns,
   setRememberAgents,
+  readParentTools,
+  trackRunPromptOptions,
 } from "../src/agent-runner.js";
 import { setCacheRetention } from "../src/cache-retention.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
@@ -455,6 +457,31 @@ describe("agent-runner final output capture", () => {
     expect(session.setActiveToolsByName).toHaveBeenCalled();
     // the view reads everything else straight through
     expect(view.getExtensions()).toBe(loaderExtensionsRef.current);
+  });
+
+  it("a parent's rule bullets include those another extension adds for a tool in the current run", () => {
+    const handlers: Array<(e: any) => void> = [];
+    const parentPi = {
+      on: (event: string, h: (e: any) => void) => { if (event === "before_agent_start") handlers.push(h); },
+      getAllTools: () => [
+        { name: "spawn_session", promptGuidelines: ["Use spawn_session for parallel work"] },
+        { name: "read" },
+      ],
+    } as any;
+    // before any run: the tools' own bullets only
+    expect(readParentTools(parentPi)).toEqual([
+      { name: "spawn_session", promptGuidelines: ["Use spawn_session for parallel work"] },
+      { name: "read", promptGuidelines: [] },
+    ]);
+    trackRunPromptOptions(parentPi);
+    const options: any = { toolGuidelines: {} };
+    for (const h of handlers) h({ systemPromptOptions: options });
+    // another extension's handler adds its bullet to the same options object after ours ran
+    options.toolGuidelines.spawn_session = ["Prefer a subagent for a quick lookup"];
+    expect(readParentTools(parentPi)).toEqual([
+      { name: "spawn_session", promptGuidelines: ["Use spawn_session for parallel work", "Prefer a subagent for a quick lookup"] },
+      { name: "read", promptGuidelines: [] },
+    ]);
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {

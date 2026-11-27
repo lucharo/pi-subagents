@@ -20,7 +20,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { AgentManager, isTopLevelAgent, stalledMessage } from "./agent-manager.js";
 import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findAgentRecordEntry, reopenTarget } from "./agent-record-entry.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent, trackRunPromptOptions } from "./agent-runner.js";
 import { formatAgentTypeList, getAgentConfig, getAvailableTypes, getConfig, getFallbackSubagent, getModelLabelFromConfig, getToolDescriptionMode, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent, setToolDescriptionMode } from "./agent-types.js";
 import { getCacheRetention, setCacheRetention } from "./cache-retention.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -1548,6 +1548,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("agent_start", () => { runStarted = true; });
+  // a child spawned in this run drops the rule bullets other extensions add per run for tools it lacks
+  trackRunPromptOptions(pi);
 
   pi.on("agent_before_settle", async (event, ctx) => {
     if (!isHeadless(ctx) || !hasBackgroundWork()) return;
