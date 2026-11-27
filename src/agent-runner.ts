@@ -877,6 +877,11 @@ export const CHILD_RESOURCES_EVENT = "subagents:child-resources";
  * - `excludeTools`: tool names dropped from the child, as `disallowed_tools:` entries are;
  * - `skillsCatalog`: set `false` to leave the skills catalog out of the child's prompt (skills still load by name);
  * - `promptNote`: one line appended to the child's prompt.
+ *
+ * `keepsTool(name)` is read-only: whether the child can have that tool given its agent file and this spawn
+ * (a `disallowed_tools:` entry, a built-in it lacks, an `ext:` allowlist that does not name it, or extensions it
+ * does not inherit in full all say no). The parent's own tools say nothing about that, so a listener that leaves
+ * the catalog out because a tool can stand in for it asks here first.
  */
 export interface ChildResourcesRequest {
   type: string;
@@ -884,6 +889,7 @@ export interface ChildResourcesRequest {
   excludeTools: string[];
   skillsCatalog: boolean;
   promptNote?: string;
+  keepsTool: (name: string) => boolean;
 }
 
 /** What {@link askChildResources} applies, after the agent file's own settings won. */
@@ -915,9 +921,18 @@ export function askChildResources(
   type: string,
   config: { extensions: true | string[] | false; excludeExtensions?: string[]; skills: true | string[] | false },
   named: Iterable<string> = [],
+  keepsTool: (name: string) => boolean = () => false,
 ): ChildResources | undefined {
   if (!pi?.events) return undefined;
-  const request: ChildResourcesRequest = { type, excludeExtensions: [], excludeTools: [], skillsCatalog: true };
+  const request: ChildResourcesRequest = {
+    type,
+    excludeExtensions: [],
+    excludeTools: [],
+    skillsCatalog: true,
+    keepsTool: (name) => {
+      try { return typeof name === "string" && keepsTool(name); } catch { return false; }
+    },
+  };
   try {
     pi.events.emit(CHILD_RESOURCES_EVENT, request);
   } catch {
@@ -1030,7 +1045,19 @@ export async function runAgent(
     ...(agentConfig?.namedToolNames ?? []),
     ...[...parseExtSelectors(agentConfig?.extSelectors ?? []).narrowing.values()].flatMap((set) => [...set]),
   ];
-  const hooked = isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames);
+  let toolNames = getToolNamesForType(type);
+  // Whether the child can have a tool, as far as its agent file and this spawn decide (see ChildResourcesRequest).
+  // Extensions it does not inherit in full, or an `ext:` allowlist, keep only what is named: which extension
+  // serves a tool is not known here.
+  const fileDenied = new Set([...(agentConfig?.disallowedTools ?? []), ...(deniedToolNames(options.disallowedTools) ?? [])]);
+  const extAllowlist = parseExtSelectors(agentConfig?.extSelectors ?? []).extNames.size > 0;
+  const childKeepsTool = (name: string): boolean => {
+    if (fileDenied.has(name) || EXCLUDED_TOOL_NAMES.includes(name)) return false;
+    if (BUILTIN_TOOL_NAMES.includes(name)) return toolNames.includes(name);
+    if (config.extensions !== true || config.excludeExtensions?.length) return false;
+    return !extAllowlist || ownToolNames.includes(name);
+  };
+  const hooked = isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames, childKeepsTool);
   // Resolve extensions/skills: isolated overrides to false
   const extensions = isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
@@ -1053,8 +1080,6 @@ export async function runAgent(
   // Still pass noSkills: true since we don't need the skill loader to load them again.
   const noSkills = skills === false || Array.isArray(skills);
   const appendMode = (agentConfig?.promptMode ?? "append") === "append";
-
-  let toolNames = getToolNamesForType(type);
 
   // The definition's deny list plus this spawn's. Built once: the memory check
   // below and the tool scoping after it must agree on what is denied.

@@ -3037,6 +3037,38 @@ describe("agent-runner exclude_extensions", () => {
     expect(lastToolsPassed()).not.toContain("mcp_tool");
   });
 
+  it("subagents:child-resources keepsTool says what this child can have, by its agent file", async () => {
+    const asked: Record<string, boolean>[] = [];
+    const probe = ["skills", "plan", "bash", "grep", "Agent"];
+    const piWithListener = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel === "subagents:child-resources") asked.push(Object.fromEntries(probe.map((n) => [n, data.keepsTool(n)])));
+        },
+      },
+    } as any;
+    const spawn = async (overrides: Record<string, unknown>, opts: Record<string, unknown> = {}) => {
+      createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig(overrides));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig(overrides));
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(["read", "bash", "edit", "write"]);
+      await runAgent(ctx, "general-purpose", "go", { pi: piWithListener, ...opts });
+      return asked.at(-1);
+    };
+    withExtensions({ "/ext/actions.ts": ["skills"], "/ext/plan.ts": ["plan"] });
+
+    // inherits every extension: an extension tool is kept; a built-in only when the agent has it; never Agent
+    expect(await spawn({ extensions: true })).toEqual({ skills: true, plan: true, bash: true, grep: false, Agent: false });
+    // its own disallowed_tools, or this spawn's, take a tool away
+    expect(await spawn({ extensions: true, disallowedTools: ["skills"] })).toMatchObject({ skills: false, plan: true });
+    expect(await spawn({ extensions: true }, { disallowedTools: ["plan"] })).toMatchObject({ skills: true, plan: false });
+    // an ext: allowlist keeps only what it names
+    expect(await spawn({ extensions: true, extSelectors: ["ext:plan/plan"] })).toMatchObject({ skills: false, plan: true });
+    // extensions it does not inherit in full: which one serves a tool is not known, so no
+    expect(await spawn({ extensions: ["plan"] })).toMatchObject({ skills: false, plan: false, bash: true });
+    expect(await spawn({ extensions: true, excludeExtensions: ["plan"] })).toMatchObject({ skills: false });
+  });
+
   it("subagents:child-resources excludeTools drops tools, but never one the agent file names itself", async () => {
     const piWithListener = {
       events: {

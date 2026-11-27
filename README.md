@@ -991,6 +991,9 @@ Before each spawn that is not `isolated`, pi-subagents emits `subagents:child-re
 | `excludeTools` | `[]` | tool names, dropped as `disallowed_tools:` entries are | always, except a tool the agent file names itself (`tools:` built-ins, `ext:ext/tool`) |
 | `skillsCatalog` | `true` | `false`: no skills catalog in the child's prompt (the inherited parent prompt never carries one); skills still load, so `/skill:name` and a `skills: [names]` preload work | the agent inherits every skill (`skills: true`) |
 | `promptNote` | — | one line appended to the child's prompt (whitespace folded, at most 500 characters) | always |
+| `keepsTool(name)` | — | read only: whether the child can have that tool. No when its agent file denies it (`disallowed_tools:`), when it is a built-in the agent lacks, when an `ext:` allowlist does not name it, or when the agent does not inherit every extension | — |
+
+A listener that leaves the catalog out because a tool stands in for it (a `skills` tool that searches and reads skills) should ask `keepsTool` first: the parent's own tools say nothing about what this child keeps.
 
 A nested child (an agent with `allowed_subagents` spawning its own) is asked on the top-level session's bus as well: the top-level session's listeners decide for the whole tree, since a child loads its extensions from the same packages.
 
