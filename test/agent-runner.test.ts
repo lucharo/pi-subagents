@@ -3173,6 +3173,20 @@ describe("agent-runner exclude_extensions", () => {
     expect(lastToolsPassed()).not.toContain("mcp_tool");
   });
 
+  it("subagents:child-resources names the session that starts the child, and none when its context has no session id", async () => {
+    const heard: (string | undefined)[] = [];
+    const piWithListener = { events: { emit(channel: string, data: any) { if (channel === "subagents:child-resources") heard.push(data.parentSessionId); } } } as any;
+    const spawn = async (spawner: any) => {
+      createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+      setupAgent({ extensions: true });
+      await runAgent(spawner, "general-purpose", "go", { pi: piWithListener });
+    };
+    await spawn({ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "session-of-subagent-a" } });
+    await spawn(ctx); // a context without getSessionId
+    await spawn({ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => { throw new Error("gone"); } } });
+    expect(heard).toEqual(["session-of-subagent-a", undefined, undefined]);
+  });
+
   it("subagents:child-resources keepsTool says what this child can have, by its agent file", async () => {
     const asked: Record<string, boolean>[] = [];
     const probe = ["skills", "plan", "bash", "grep", "Agent"];

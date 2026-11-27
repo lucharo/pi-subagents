@@ -891,6 +891,10 @@ export const CHILD_RESOURCES_EVENT = "subagents:child-resources";
  * (a `disallowed_tools:` entry, a built-in it lacks, an `ext:` allowlist that does not name it, or extensions it
  * does not inherit in full all say no). The parent's own tools say nothing about that, so a listener that leaves
  * the catalog out because a tool can stand in for it asks here first.
+ *
+ * `parentSessionId` is read-only: the session id of the context that starts this child (the parent subagent's for a
+ * nested child, whose request still goes to the top session's `pi.events`). The child starts later in the same async
+ * call as the emit, so a value a listener enters in an AsyncLocalStorage here reaches the child's `session_start`.
  */
 export interface ChildResourcesRequest {
   type: string;
@@ -899,6 +903,7 @@ export interface ChildResourcesRequest {
   skillsCatalog: boolean;
   promptNote?: string;
   keepsTool: (name: string) => boolean;
+  parentSessionId?: string;
 }
 
 /** What {@link askChildResources} applies, after the agent file's own settings won. */
@@ -931,6 +936,7 @@ export function askChildResources(
   config: { extensions: true | string[] | false; excludeExtensions?: string[]; skills: true | string[] | false },
   named: Iterable<string> = [],
   keepsTool: (name: string) => boolean = () => false,
+  parentSessionId?: string,
 ): ChildResources | undefined {
   if (!pi?.events) return undefined;
   const request: ChildResourcesRequest = {
@@ -941,6 +947,7 @@ export function askChildResources(
     keepsTool: (name) => {
       try { return typeof name === "string" && keepsTool(name); } catch { return false; }
     },
+    ...(parentSessionId ? { parentSessionId } : {}),
   };
   try {
     pi.events.emit(CHILD_RESOURCES_EVENT, request);
@@ -1107,7 +1114,9 @@ export async function runAgent(
     if (mcpPatterns && MCP_BRIDGE_TOOL_NAMES.has(name)) return true;
     return !extAllowlist || ownToolNames.includes(name);
   };
-  const hooked = isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames, childKeepsTool);
+  let parentSessionId: string | undefined;
+  try { parentSessionId = ctx.sessionManager?.getSessionId?.() || undefined; } catch { parentSessionId = undefined; }
+  const hooked = isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames, childKeepsTool, parentSessionId);
   // Resolve extensions/skills: isolated overrides to false
   const extensions = isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
