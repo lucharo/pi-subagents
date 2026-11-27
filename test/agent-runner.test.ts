@@ -164,9 +164,11 @@ import {
   setGraceTurns,
   setRememberAgents,
   readParentTools,
+  snapshotRunGuidelines,
   trackRunPromptOptions,
 } from "../src/agent-runner.js";
 import { setCacheRetention } from "../src/cache-retention.js";
+import { stripLackedToolLines } from "../src/prompts.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -479,9 +481,48 @@ describe("agent-runner final output capture", () => {
     // another extension's handler adds its bullet to the same options object after ours ran
     options.toolGuidelines.spawn_session = ["Prefer a subagent for a quick lookup"];
     expect(readParentTools(parentPi)).toEqual([
-      { name: "spawn_session", promptGuidelines: ["Use spawn_session for parallel work", "Prefer a subagent for a quick lookup"] },
+      { name: "spawn_session", promptGuidelines: ["Prefer a subagent for a quick lookup"] },
       { name: "read", promptGuidelines: [] },
     ]);
+  });
+
+  it("the run's bullets for a tool are exactly what Pi renders: an emptied list keeps a shared bullet off that tool", () => {
+    const handlers: Array<(e: any) => void> = [];
+    const parentPi = {
+      on: (event: string, h: (e: any) => void) => { if (event === "before_agent_start") handlers.push(h); },
+      getAllTools: () => [
+        { name: "pin_widget", promptGuidelines: ["Pin a widget for long tasks"] },
+        { name: "unpin_widget", promptGuidelines: ["Pin a widget for long tasks"] },
+      ],
+    } as any;
+    trackRunPromptOptions(parentPi);
+    // Pi seeds the run's options with every tool's own bullets; a handler clears unpin_widget's
+    const options: any = { toolGuidelines: { pin_widget: ["Pin a widget for long tasks"], unpin_widget: ["Pin a widget for long tasks"] } };
+    for (const h of handlers) h({ systemPromptOptions: options });
+    options.toolGuidelines.unpin_widget = [];
+    const tools = readParentTools(parentPi);
+    expect(tools).toEqual([
+      { name: "pin_widget", promptGuidelines: ["Pin a widget for long tasks"] },
+      { name: "unpin_widget", promptGuidelines: [] },
+    ]);
+    // a child with unpin_widget but not pin_widget no longer reads the pin bullet
+    const prompt = "<rules>\n- Pin a widget for long tasks\n- Be concise in your responses\n</rules>";
+    expect(stripLackedToolLines(prompt, tools, ["unpin_widget"])).toBe("<rules>\n- Be concise in your responses\n</rules>");
+  });
+
+  it("a child judges its inherited prompt by the bullets of the run that spawned it, not a later run's", () => {
+    const handlers: Array<(e: any) => void> = [];
+    const parentPi = {
+      on: (event: string, h: (e: any) => void) => { if (event === "before_agent_start") handlers.push(h); },
+      getAllTools: () => [{ name: "spawn_session" }],
+    } as any;
+    trackRunPromptOptions(parentPi);
+    for (const h of handlers) h({ systemPromptOptions: { toolGuidelines: { spawn_session: ["Prefer a subagent"] } } });
+    const snapshot = snapshotRunGuidelines(parentPi);
+    // the parent's next run starts while the child is still loading
+    for (const h of handlers) h({ systemPromptOptions: { toolGuidelines: { spawn_session: [] } } });
+    expect(readParentTools(parentPi, snapshot)).toEqual([{ name: "spawn_session", promptGuidelines: ["Prefer a subagent"] }]);
+    expect(readParentTools(parentPi)).toEqual([{ name: "spawn_session", promptGuidelines: [] }]);
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {

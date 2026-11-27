@@ -962,16 +962,24 @@ export function trackRunPromptOptions(pi: Pick<ExtensionAPI, "on">): void {
 
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((g): g is string => typeof g === "string") : []);
 
-/** The parent's tools with their rule bullets: each tool's own `promptGuidelines` from `pi.getAllTools()`, plus the
- * bullets the current run's prompt options add for it; [] when unavailable. */
-export function readParentTools(pi: unknown): PromptToolInfo[] {
+/** A copy of the current run's per-tool rule bullets on `pi`, taken when a child is spawned, so a later run of the
+ * parent cannot change what the child's inherited prompt is judged against; undefined before any run. */
+export function snapshotRunGuidelines(pi: unknown): Record<string, string[]> | undefined {
+  const run = (pi && typeof pi === "object" ? runPromptOptions.get(pi) : undefined)?.toolGuidelines;
+  if (!run || typeof run !== "object") return undefined;
+  return Object.fromEntries(Object.entries(run).map(([name, list]) => [name, strings(list)]));
+}
+
+/** The parent's tools with their rule bullets. A tool the run's prompt options name takes exactly those bullets (Pi
+ * renders from them, including a bullet another extension added or an empty list it left); a tool they do not name
+ * takes its own `promptGuidelines` from `pi.getAllTools()`. [] when unavailable. */
+export function readParentTools(pi: unknown, run: Record<string, string[]> | undefined = snapshotRunGuidelines(pi)): PromptToolInfo[] {
   try {
     const all = (pi as { getAllTools?: () => Array<{ name?: unknown; promptGuidelines?: unknown }> } | undefined)?.getAllTools?.();
     if (!Array.isArray(all)) return [];
-    const run = (pi && typeof pi === "object" ? runPromptOptions.get(pi) : undefined)?.toolGuidelines ?? {};
     return all.flatMap((t) =>
       typeof t?.name === "string"
-        ? [{ name: t.name, promptGuidelines: [...new Set([...strings(t.promptGuidelines), ...strings(run[t.name])])] }]
+        ? [{ name: t.name, promptGuidelines: run && Object.hasOwn(run, t.name) ? [...run[t.name]] : strings(t.promptGuidelines) }]
         : [],
     );
   } catch {
@@ -1041,6 +1049,9 @@ export async function runAgent(
   // Get parent system prompt for append-mode agents, without the sections the
   // child session renders itself (skills, cwd, extension sections).
   const parentSystemPrompt = inheritableParentPrompt(ctx.getSystemPrompt(), ctx.cwd);
+  // The run's per-tool rule bullets that prompt was rendered from, taken now: the loader awaits below, and a later
+  // parent run could change them meanwhile.
+  const parentRunGuidelines = snapshotRunGuidelines(options.pi);
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
@@ -1279,7 +1290,7 @@ export async function runAgent(
   // The child's own session reads its prompt through this view, which drops the lines of parent tools
   // the child does not have, judged against the child's active tools on every rebuild (pi rebuilds the
   // prompt whenever the active set changes, including late registrations).
-  const parentTools: PromptToolInfo[] = appendMode ? readParentTools(options.pi) : [];
+  const parentTools: PromptToolInfo[] = appendMode ? readParentTools(options.pi, parentRunGuidelines) : [];
   const promptView = parentTools.length ? lackedToolLinesView(loader, parentTools) : undefined;
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
