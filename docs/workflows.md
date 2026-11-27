@@ -472,6 +472,9 @@ Not a git repo, no commits yet, or `git worktree add` failed. Isolation is a str
 **`No saved workflow named "x". Looked in: …`**
 The file is not in any of the three directories, or it is there but carries no `export const meta =` declaration, so it is not recognized as a workflow. The message lists the directories it searched and any workflows it did find.
 
+**An agent failed with `Stopped responding: nothing written for 60 min.`**
+It streamed nothing, ran no tool and reported no usage for the [`staleAgentMinutes`](../README.md#persistent-settings) limit (default 60), usually a wedged provider stream. It is aborted and its `agent()` returns `null`, so the run goes on without it. A run with no agent in flight that makes no progress for the same time (a script awaiting something that never settles) fails with `Workflow stopped responding: …`. Raise the limit, or set `0` to turn the check off, if your agents legitimately go that long without output.
+
 **The run seems stuck with agents queued.**
 Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slots free. A pause (`p`) also holds new starts while letting running agents finish.
 

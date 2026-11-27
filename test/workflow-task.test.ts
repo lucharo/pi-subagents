@@ -9,7 +9,7 @@
  * the outside. So it gets driven directly, against a control stub.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { collapse, type WorkflowEntry } from "../src/workflow/progress.js";
 import type { WorkflowControl } from "../src/workflow/runtime.js";
 import {
@@ -20,6 +20,7 @@ import {
   resumeWorkflowTask,
   updateWorkflowProgressBatch,
   type WorkflowTask,
+  workflowStalled,
 } from "../src/workflow/task.js";
 
 function stubControl(): WorkflowControl & { pause: ReturnType<typeof vi.fn> } {
@@ -168,5 +169,64 @@ describe("updateWorkflowProgressBatch", () => {
     expect(task.phaseLabel).toBe("Scanning (1/2)");
     updateWorkflowProgressBatch(task, [{ ...agent(0, "done", 1), phaseIndex: 0 }]);
     expect(task.phaseLabel).toBe("");
+  });
+});
+
+describe("a run that stops responding", () => {
+  const HOUR = 60 * 60_000;
+  const STALLED = "Workflow stopped responding: nothing written for 60 min.";
+  const meta = { name: "n", description: "d" };
+  const row = (index: number, state: "start" | "done" | "error"): WorkflowEntry =>
+    ({ type: "workflow_agent", index, label: `a${index}`, state, queuedAt: 1_000, startedAt: 1_000 });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("is stalled once its log has not moved for the limit and no agent is in flight", () => {
+    const { task } = runningTask();
+    expect(workflowStalled(task, 1_000 + HOUR - 1, HOUR)).toBe(false);
+    expect(workflowStalled(task, 1_000 + HOUR, HOUR)).toBe(true);
+  });
+
+  it("is not stalled while an agent is in flight, however quiet", () => {
+    const { task } = runningTask();
+    vi.setSystemTime(2_000);
+    updateWorkflowProgressBatch(task, [row(0, "done"), row(1, "start")]);
+    expect(workflowStalled(task, 2_000 + 10 * HOUR, HOUR)).toBe(false);
+    updateWorkflowProgressBatch(task, [row(1, "error")]);
+    expect(workflowStalled(task, 2_000 + HOUR, HOUR)).toBe(true);
+  });
+
+  it("counts from its last progress, and a resume starts the clock again", () => {
+    const { task } = runningTask();
+    vi.setSystemTime(5_000);
+    updateWorkflowProgressBatch(task, [row(0, "done")]);
+    expect(workflowStalled(task, 5_000 + HOUR - 1, HOUR)).toBe(false);
+    pauseWorkflowTask(task, 6_000);
+    expect(workflowStalled(task, 6_000 + 5 * HOUR, HOUR)).toBe(false);
+    resumeWorkflowTask(task, 6_000 + 5 * HOUR);
+    expect(workflowStalled(task, 6_000 + 6 * HOUR - 1, HOUR)).toBe(false);
+    expect(workflowStalled(task, 6_000 + 6 * HOUR, HOUR)).toBe(true);
+  });
+
+  it("is never stalled with the check off, or once settled", () => {
+    const { task } = runningTask();
+    expect(workflowStalled(task, 1_000 + 100 * HOUR, 0)).toBe(false);
+    failWorkflowTask(task, "boom");
+    expect(workflowStalled(task, 1_000 + 100 * HOUR, HOUR)).toBe(false);
+  });
+
+  it("settles as failed with the stall's reason, not as a user stop", () => {
+    const { task } = runningTask();
+    task.stalled = STALLED;
+    completeWorkflowTask(task, { status: "killed", error: "Workflow aborted.", meta, progress: [], agentCount: 0, replayedCount: 0, failures: [] });
+    expect(task.status).toBe("failed");
+    expect(task.error).toBe(STALLED);
+  });
+
+  it("keeps its own outcome when it ended by itself as the check fired", () => {
+    const { task } = runningTask();
+    task.stalled = STALLED;
+    completeWorkflowTask(task, { status: "completed", value: 1, meta, progress: [], agentCount: 0, replayedCount: 0, failures: [] });
+    expect(task.status).toBe("completed");
+    expect(task.error).toBeUndefined();
   });
 });

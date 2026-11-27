@@ -486,6 +486,20 @@ describe("settings persistence", () => {
       }
     });
 
+    it("keeps staleAgentMinutes, including 0 (check off) and the one-week ceiling", () => {
+      for (const ok of [0, 60, 10_080]) {
+        writeProject({ staleAgentMinutes: ok });
+        expect(loadSettings(projectDir)).toEqual({ staleAgentMinutes: ok });
+      }
+    });
+
+    it("drops out-of-range or non-integer staleAgentMinutes", () => {
+      for (const bad of [-1, 10_081, 1.5, "sixty", null]) {
+        writeProject({ staleAgentMinutes: bad });
+        expect(loadSettings(projectDir).staleAgentMinutes).toBeUndefined();
+      }
+    });
+
     it("accepts defaultMaxTurns: 0 (explicit unlimited)", () => {
       writeProject({ defaultMaxTurns: 0 });
       expect(loadSettings(projectDir)).toEqual({ defaultMaxTurns: 0 });

@@ -18,7 +18,7 @@ import { Container, isKeyRelease, matchesKey, type ScrollViewScrollbar, type Set
 import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, stalledMessage } from "./agent-manager.js";
 import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findAgentRecordEntry, reopenTarget } from "./agent-record-entry.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { formatAgentTypeList, getAgentConfig, getAvailableTypes, getConfig, getFallbackSubagent, getModelLabelFromConfig, getToolDescriptionMode, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent, setToolDescriptionMode } from "./agent-types.js";
@@ -94,7 +94,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId, workflowStalled } from "./workflow/task.js";
 import { workflowToolDescription } from "./workflow/tool-description.js";
 import { toWorkflowDetail, toWorkflowInfo, workflowArgs, workflowResult } from "./workflow-info.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
@@ -1132,6 +1132,7 @@ export default function (pi: ExtensionAPI) {
     scheduler.stop();
     // Before abortAll, and not folded into it: a workflow owns a worker thread
     // as well as its children, and only its own signal terminates that.
+    clearInterval(workflowStallTimer);
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     workflowRuns.clear();
@@ -1578,6 +1579,7 @@ export default function (pi: ExtensionAPI) {
     setDefaultMaxTurns,
     setGraceTurns,
     setHeadlessWaitMinutes: (n) => { headlessWaitMinutes = Math.max(0, n); },
+    setStaleAgentMinutes: (n) => manager.setStallLimitMs(n * 60_000),
     setDefaultJoinMode,
     setBackgroundByDefault,
     setSchedulingEnabled,
@@ -2603,6 +2605,24 @@ Terse command-style prompts produce shallow, generic work.
   const workflowTasks = new Map<string, WorkflowTask>();
 
   /**
+   * A run with no agent in flight whose progress log has not moved for the
+   * stall limit is spinning, or waiting on nothing (see `workflowStalled`).
+   * Stopped as a failure: that settles it and notifies the parent as any
+   * finished run does. Its agents have a stall check of their own, on the
+   * manager.
+   */
+  const workflowStallTimer = setInterval(() => {
+    const limit = manager.getStallLimitMs();
+    const now = Date.now();
+    for (const task of workflowTasks.values()) {
+      if (!workflowStalled(task, now, limit)) continue;
+      task.stalled = `Workflow ${stalledMessage(limit).replace(/^Stopped/, "stopped")}`;
+      task.abortController.abort();
+    }
+  }, 60_000);
+  workflowStallTimer.unref();
+
+  /**
    * pi's renderer mode, as last seen on a TUI the fleet list was drawn into.
    * Remembered rather than read off the list's live handle, which pi clears on
    * every theme change and mode switch until the list registers again. Before
@@ -3350,6 +3370,8 @@ Terse command-style prompts produce shallow, generic work.
       graceTurns: getGraceTurns(),
       // 0 = no limit, the default — see SubagentsSettings.
       headlessWaitMinutes,
+      // 0 = check off — see SubagentsSettings.
+      staleAgentMinutes: Math.round(manager.getStallLimitMs() / 60_000),
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
@@ -3485,6 +3507,7 @@ Terse command-style prompts produce shallow, generic work.
       const dmt = getDefaultMaxTurns() ?? 0;
       const gt = getGraceTurns();
       const msd = getMaxSubagentDepth();
+      const sam = Math.round(manager.getStallLimitMs() / 60_000);
       // Label what unset actually does — it targets general-purpose even when
       // that is unregistered (the permissive hardcoded tier), so showing "none"
       // there would advertise strict dispatch for the most permissive state.
@@ -3544,6 +3567,13 @@ Terse command-style prompts produce shallow, generic work.
           description: "pi -p: minutes to wait for background work before stopping it (0 = no limit, Enter to type)",
           currentValue: String(headlessWaitMinutes),
           values: [String(headlessWaitMinutes)],
+        },
+        {
+          id: "staleAgentMinutes",
+          label: "Stall timeout (min)",
+          description: "Minutes an agent may write nothing before it is marked failed (0 = off, Enter to type)",
+          currentValue: String(sam),
+          values: [String(sam)],
         },
         {
           id: "joinMode",
@@ -3785,6 +3815,14 @@ Terse command-style prompts produce shallow, generic work.
           notifyApplied(ctx, target, n === 0
             ? "Headless wait set to no limit"
             : `Headless wait set to ${n} min`);
+        }
+      } else if (id === "staleAgentMinutes") {
+        const n = parseInt(value, 10);
+        if (n >= 0) {
+          manager.setStallLimitMs(n * 60_000);
+          notifyApplied(ctx, target, n === 0
+            ? "Stall timeout turned off"
+            : `Stall timeout set to ${n} min`);
         }
       } else if (id === "maxSubagentDepth") {
         const n = parseInt(value, 10);

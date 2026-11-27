@@ -93,6 +93,40 @@ const DEFAULT_MAX_CONCURRENT_NESTED = 10;
 const MAX_TOMBSTONES = 100;
 
 /**
+ * How long a running agent may write nothing (no streamed text, no tool event,
+ * no usage) before it counts as dead and is marked failed. One hour: a model
+ * turn or a tool call that is silent that long has, in practice, stopped. `0`
+ * turns the check off (`staleAgentMinutes` in settings).
+ */
+export const DEFAULT_STALL_LIMIT_MS = 60 * 60_000;
+
+/**
+ * How long a stopped agent's run may take to wind down before the manager
+ * settles it anyway. A stop that a wedged provider stream ignores would
+ * otherwise leave its caller (a workflow, a foreground `Agent` call) waiting
+ * for good, and its concurrency slot taken.
+ */
+export const STOP_GRACE_MS = 30_000;
+
+/** The error a stalled agent is marked with. */
+export function stalledMessage(limitMs: number): string {
+  const minutes = Math.max(1, Math.round(limitMs / 60_000));
+  return `Stopped responding: nothing written for ${minutes} min.`;
+}
+
+/**
+ * One live run, as the stall check sees it. `cut` settles the run from outside
+ * (pool slot, notification, whoever awaits it) the way the run's own ending
+ * would have, for a run whose ending never comes.
+ */
+interface RunWatch {
+  lastActivityAt: number;
+  settled: boolean;
+  cut: () => void;
+  off?: () => void;
+}
+
+/**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
  * (parent cwd). Anything else must be an absolute path to an existing
  * directory — curated errors instead of TypeErrors from path/fs internals
@@ -450,6 +484,12 @@ export class AgentManager {
    * out.
    */
   private queue: { id: string; pool: Pool; start: () => Promise<void>; release: () => void }[] = [];
+  /**
+   * Runs in flight, by record id: when each last wrote anything, and how to
+   * settle it if it never ends by itself. See `reapStalled`.
+   */
+  private watches = new Map<string, RunWatch>();
+  private stallLimitMs = DEFAULT_STALL_LIMIT_MS;
   /** Number of currently running background agents. */
   private runningBackground = 0;
   /** Number of currently running foreground (blocking) agents. */
@@ -469,8 +509,12 @@ export class AgentManager {
     this.onUsage = onUsage;
     this.onSteered = onSteered;
     this.maxConcurrent = maxConcurrent;
-    // Cleanup completed agents after 10 minutes (but keep sessions for resume)
-    this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
+    // Cleanup completed agents after 10 minutes (but keep sessions for resume),
+    // after settling any run that stopped responding.
+    this.cleanupInterval = setInterval(() => {
+      this.reapStalled();
+      this.cleanup();
+    }, 60_000);
     this.cleanupInterval.unref();
   }
 
@@ -506,6 +550,97 @@ export class AgentManager {
 
   getMaxConcurrentNested(): number {
     return this.maxConcurrentNested;
+  }
+
+  /** How long a running agent may write nothing before it is marked failed. 0 = never. */
+  setStallLimitMs(ms: number) {
+    this.stallLimitMs = Math.max(0, ms);
+  }
+
+  getStallLimitMs(): number {
+    return this.stallLimitMs;
+  }
+
+  /**
+   * Start watching a run. `cut` is what settles it from outside; the run's own
+   * ending calls `claimRun` first and skips its settle when the watch was cut.
+   */
+  private watchRun(id: string, cut: () => void): RunWatch {
+    this.watches.get(id)?.off?.();
+    const watch: RunWatch = { lastActivityAt: Date.now(), settled: false, cut };
+    this.watches.set(id, watch);
+    return watch;
+  }
+
+  /**
+   * A sign of life from `id`'s run. Passed up the owner chain too: a parent
+   * awaiting a nested child sits in one long tool call, writing nothing of its
+   * own, for as long as that child works.
+   */
+  private touchRun(id: string): void {
+    const now = Date.now();
+    for (let r = this.agents.get(id); r; r = r.parentAgentId ? this.agents.get(r.parentAgentId) : undefined) {
+      const watch = this.watches.get(r.id);
+      if (watch) watch.lastActivityAt = now;
+    }
+  }
+
+  /** Count every event a session emits (streamed text, tool output) as a sign of life. */
+  private followSession(id: string, watch: RunWatch, session: AgentSession | undefined): void {
+    // A session that arrives after the run was settled from outside belongs to
+    // nobody: following it would only keep a dead watch warm.
+    if (watch.settled || typeof session?.subscribe !== "function") return;
+    watch.off?.();
+    try {
+      watch.off = session.subscribe(() => this.touchRun(id));
+    } catch { /* a stubbed session: the run's own callbacks still count */ }
+  }
+
+  /**
+   * Mark a run as settled by its own ending. False when the stall check got
+   * there first, in which case the caller must not settle it again: that would
+   * free its pool slot twice and notify twice.
+   */
+  private claimRun(id: string, watch: RunWatch): boolean {
+    if (watch.settled) return false;
+    watch.settled = true;
+    watch.off?.();
+    if (this.watches.get(id) === watch) this.watches.delete(id);
+    return true;
+  }
+
+  /**
+   * Settle the runs that will not end by themselves. Runs on the cleanup tick (every minute):
+   *   - a running agent that has written nothing for the stall limit is marked
+   *     `error` ("Stopped responding: …"), aborted, and settled;
+   *   - a stopped agent whose run ignored the stop for {@link STOP_GRACE_MS} is
+   *     settled as stopped.
+   * Settling releases the concurrency slot, fires the usual completion
+   * callback, and wakes whoever awaits the run (a workflow's `agent()`, a
+   * foreground `Agent` call), so nothing goes on reporting it as running.
+   */
+  reapStalled(now = Date.now()): void {
+    for (const [id, watch] of [...this.watches]) {
+      const record = this.agents.get(id);
+      if (!record) continue;
+      if (record.status === "running") {
+        if (this.stallLimitMs <= 0 || now - watch.lastActivityAt < this.stallLimitMs) continue;
+        record.status = "error";
+        record.error = stalledMessage(this.stallLimitMs);
+        record.completedAt = now;
+        record.abortController?.abort();
+      } else if (record.status === "stopped") {
+        if (now - (record.completedAt ?? now) < STOP_GRACE_MS) continue;
+      } else {
+        // Finished, and winding down (a gate, worktree cleanup): its own
+        // ending settles it.
+        continue;
+      }
+      watch.settled = true;
+      watch.off?.();
+      this.watches.delete(id);
+      try { watch.cut(); } catch { /* a settle side effect must not stop the sweep */ }
+    }
   }
 
   /**
@@ -889,6 +1024,23 @@ export class AgentManager {
     else this.armParentAbort(record, options.signal);
     const detach = () => this.detachParentAbort(record);
 
+    // Settles the run from outside when it stops responding (`reapStalled`):
+    // the same tail the run's own ending runs below, minus the parts that need
+    // its result. `cutLoose` wakes whoever awaits `record.promise`.
+    let cutLoose!: () => void;
+    const cutOff = new Promise<void>(resolve => { cutLoose = resolve; });
+    const watch = this.watchRun(id, () => {
+      detach();
+      if (record.outputCleanup) {
+        try { record.outputCleanup(); } catch { /* ignore */ }
+        record.outputCleanup = undefined;
+      }
+      this.abortOwnedChildren(id);
+      this.settleRun(record, true);
+      cutLoose();
+    });
+    const touch = () => this.touchRun(id);
+
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
@@ -914,12 +1066,14 @@ export class AgentManager {
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
+        touch();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
       onAssistantUsage: (usage) => {
+        touch();
         addUsage(record.lifetimeUsage, usage);
         addUsage(record.ownUsage, usage);
         this.onUsage?.(record, usage);
@@ -937,7 +1091,14 @@ export class AgentManager {
         maxSubagentDepth: record.maxSubagentDepth,
       },
       onSessionCreated: (session) => {
+        // Arrived after the stall check settled the run and cleanup took the
+        // record: nothing will dispose it, so shut it down here.
+        if (watch.settled && this.agents.get(id) !== record) {
+          void shutdownChildSession(session);
+          return;
+        }
         record.session = session;
+        this.followSession(id, watch, session);
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
         // in-memory session reports undefined, which correctly means
@@ -980,20 +1141,26 @@ export class AgentManager {
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
-        this.settleOutcome(record, { text: responseText, failure, aborted, steered });
-        // Kept beside `result`, never inside it: `result` is prose meant for a
-        // reader — it is previewed, transcribed, and appended to below — while
-        // this is a machine-readable payload one caller asked for by schema.
-        record.structuredJson = structuredJson;
-        record.structuredRetried = structuredRetried;
-        record.session = session;
+        // False when the stall check settled this run already. The record may
+        // be on a newer invocation by then (a resume), so nothing of this one's
+        // outcome is written over it; only its worktree is still removed.
+        const own = this.claimRun(id, watch);
+        if (own) {
+          this.settleOutcome(record, { text: responseText, failure, aborted, steered });
+          // Kept beside `result`, never inside it: `result` is prose meant for a
+          // reader — it is previewed, transcribed, and appended to below — while
+          // this is a machine-readable payload one caller asked for by schema.
+          record.structuredJson = structuredJson;
+          record.structuredRetried = structuredRetried;
+          record.session = session;
 
-        detach();
+          detach();
 
-        // Final flush of streaming output file
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
+          // Final flush of streaming output file
+          if (record.outputCleanup) {
+            try { record.outputCleanup(); } catch { /* ignore */ }
+            record.outputCleanup = undefined;
+          }
         }
 
         // Clean up worktree if used
@@ -1001,14 +1168,14 @@ export class AgentManager {
           // The one moment the child's tree still exists and the child is done
           // writing to it. try/catch, not decoration: a hook that throws must
           // not leave the worktree behind.
-          if (options.onBeforeWorktreeCleanup) {
+          if (options.onBeforeWorktreeCleanup && own) {
             try {
               await options.onBeforeWorktreeCleanup(record.worktree.path);
             } catch { /* ignore — never block cleanup */ }
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
           record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
+          if (wtResult.hasChanges && wtResult.branch && own) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -1020,25 +1187,30 @@ export class AgentManager {
           }
         }
 
-        this.abortOwnedChildren(id);
-
-        this.settleRun(record, true);
+        if (own) {
+          this.abortOwnedChildren(id);
+          this.settleRun(record, true);
+        }
         return responseText;
       })
       .catch(async (err) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
-          record.status = "error";
-        }
-        record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt ??= Date.now();
+        // As above: a run the stall check settled writes nothing but its cleanup.
+        const own = this.claimRun(id, watch);
+        if (own) {
+          // Don't overwrite status if externally stopped via abort()
+          if (record.status !== "stopped") {
+            record.status = "error";
+          }
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt ??= Date.now();
 
-        detach();
+          detach();
 
-        // Final flush of streaming output file on error
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
+          // Final flush of streaming output file on error
+          if (record.outputCleanup) {
+            try { record.outputCleanup(); } catch { /* ignore */ }
+            record.outputCleanup = undefined;
+          }
         }
 
         // Best-effort worktree cleanup on error
@@ -1049,13 +1221,16 @@ export class AgentManager {
           } catch { /* ignore cleanup errors */ }
         }
 
-        this.abortOwnedChildren(id);
-
-        this.settleRun(record, false);
+        if (own) {
+          this.abortOwnedChildren(id);
+          this.settleRun(record, false);
+        }
         return "";
       });
 
-    this.trackRun(record, promise);
+    // Raced against the stall check, so a run that never ends still lets its
+    // awaiters go once it has been settled from outside.
+    this.trackRun(record, Promise.race([promise, cutOff.then(() => record.result ?? "")]));
 
     // Notify caller that spawn is complete (record is in the map, promise is set).
     // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
@@ -1387,18 +1562,28 @@ export class AgentManager {
     // and `get_subagent_result` with `wait` returns mid-run. Cleanup runs
     // before it resolves, so no waiter wakes with the turn's children alive.
     const session = record.session;
+    // Raced against the stall check, like the spawn path: a resumed turn that
+    // never ends is settled from outside (the record already says how), and
+    // this call returns then.
+    let cutLoose!: () => void;
+    const cutOff = new Promise<"cut">(resolve => { cutLoose = () => resolve("cut"); });
+    const watch = this.watchRun(id, () => cutLoose());
+    this.followSession(id, watch, session);
+    const touch = () => this.touchRun(id);
     const run = (async () => {
       try {
-        this.settleOutcome(record, await resumeAgent(session, prompt, {
+        const outcome = await Promise.race([resumeAgent(session, prompt, {
           type: record.type,
           children: { manager: this, parentAgentId: id },
           maxTurns: options?.maxTurns ?? record.invocation?.maxTurns,
           onTurnEnd: options?.onTurnEnd,
           onToolActivity: (activity) => {
+            touch();
             if (activity.type === "end") record.toolUses++;
             options?.onToolActivity?.(activity);
           },
           onAssistantUsage: (usage) => {
+            touch();
             addUsage(record.lifetimeUsage, usage);
             addUsage(record.ownUsage, usage);
             this.onUsage?.(record, usage);
@@ -1410,9 +1595,10 @@ export class AgentManager {
             options?.onCompaction?.(info);
           },
           signal: abortController.signal,
-        }));
+        }), cutOff]);
+        if (outcome !== "cut" && this.claimRun(id, watch)) this.settleOutcome(record, outcome);
       } catch (err) {
-        this.failResume(record, err);
+        if (this.claimRun(id, watch)) this.failResume(record, err);
       }
       this.detachParentAbort(record);
 
@@ -1518,16 +1704,26 @@ export class AgentManager {
       this.drainQueue();
     };
 
+    // Same stall check as the spawn path: a turn that never ends is settled
+    // from outside, and `record.promise` lets its awaiters go then.
+    let cutLoose!: () => void;
+    const cutOff = new Promise<void>(resolve => { cutLoose = resolve; });
+    const watch = this.watchRun(id, () => { settle(); cutLoose(); });
+    this.followSession(id, watch, record.session);
+    const touch = () => this.touchRun(id);
+
     const promise = resumeAgent(record.session, prompt, {
       type: record.type,
       children: { manager: this, parentAgentId: id },
       maxTurns: options.maxTurns ?? record.invocation?.maxTurns,
       onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
+        touch();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
       onAssistantUsage: (usage) => {
+        touch();
         addUsage(record.lifetimeUsage, usage);
         addUsage(record.ownUsage, usage);
         this.onUsage?.(record, usage);
@@ -1541,17 +1737,22 @@ export class AgentManager {
       signal: abortController.signal,
     })
       .then((outcome) => {
-        this.settleOutcome(record, outcome);
-        settle();
+        // Settled from outside already (stalled, or a stop it ignored).
+        if (this.claimRun(id, watch)) {
+          this.settleOutcome(record, outcome);
+          settle();
+        }
         return outcome.text;
       })
       .catch((err) => {
-        this.failResume(record, err);
-        settle();
+        if (this.claimRun(id, watch)) {
+          this.failResume(record, err);
+          settle();
+        }
         return "";
       });
 
-    this.trackRun(record, promise);
+    this.trackRun(record, Promise.race([promise, cutOff.then(() => record.result ?? "")]));
   }
 
   /**
@@ -1702,6 +1903,9 @@ export class AgentManager {
 
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
+    // Unreachable once the record is gone; the run's own ending still settles it.
+    this.watches.get(id)?.off?.();
+    this.watches.delete(id);
     this.tombstone(record);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
@@ -1768,6 +1972,9 @@ export class AgentManager {
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
+      // A stop its run has not answered yet: the stall check settles it within
+      // STOP_GRACE_MS, and whoever awaits it is woken then.
+      if (this.watches.has(id)) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -1775,6 +1982,7 @@ export class AgentManager {
     // parent is visited, and removed, before its children.
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
+      if (this.watches.has(id)) continue;
       if (record.parentAgentId === undefined || this.agents.has(record.parentAgentId)) continue;
       this.removeRecord(id, record);
     }
@@ -1915,6 +2123,8 @@ export class AgentManager {
     const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
     this.startups.clear();
+    for (const watch of this.watches.values()) watch.off?.();
+    this.watches.clear();
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited

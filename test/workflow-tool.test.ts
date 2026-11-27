@@ -1194,6 +1194,50 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   });
 });
 
+describe("SubagentWorkflow tool — a run that stops responding", () => {
+  let hermetic: Hermetic;
+  let booted: ReturnType<typeof makePi>;
+
+  beforeEach(() => {
+    // Before boot: the extension starts its minute tick at activation. Only the
+    // clock and that tick are faked; the worker thread and the outbox run on
+    // real timers.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
+    booted = makePi();
+    subagentsExtension(booted.pi);
+  });
+
+  afterEach(async () => {
+    await booted.lifecycle.get("session_shutdown")?.({}, ctx({ cwd: hermetic.dir }));
+    vi.useRealTimers();
+    await flush();
+    hermetic.restore();
+  });
+
+  it("fails a run with no agent in flight that makes no progress for the stall limit", async () => {
+    const result = await booted.tools.get("SubagentWorkflow").execute(
+      "tc-stalled",
+      { script: `${inlineScript}await new Promise(() => {});\n` },
+      undefined, undefined, ctx({ cwd: hermetic.dir }),
+    );
+    const taskId = /Task ID: (\S+)/.exec(textOf(result))![1];
+    const notified = () => booted.pi.sendMessage.mock.calls.find((c: any[]) => String(c[0]?.content).includes(taskId));
+
+    // The tick also moves the clock a minute: 59 minutes in.
+    vi.setSystemTime(Date.now() + 58 * 60_000);
+    vi.advanceTimersByTime(60_000);
+    await new Promise(resolve => setTimeout(resolve, NOTIFICATION_HOLD_MS + 200));
+    expect(notified()).toBeUndefined();
+
+    vi.advanceTimersByTime(60_000);
+    await vi.waitFor(() => expect(notified()).toBeDefined(), { timeout: 10_000 });
+    const sent = notified()!;
+    expect(String(sent[0].content)).toContain("<status>Error: Workflow stopped responding: nothing written for 60 min.</status>");
+    expect(sent[0].details).toMatchObject({ status: "error" });
+  });
+});
+
 /* ------------------------------------------------------------------------- *
  * The inline card following a background run (#284)
  * ------------------------------------------------------------------------- */

@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { activePhaseLabel, collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import { activePhaseLabel, collapse, elapsedMs, isLive, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -90,6 +90,17 @@ export interface WorkflowTask {
   endTime?: number;
   /** Excluded from the elapsed clock the header shows. */
   totalPausedMs: number;
+  /**
+   * When the progress log last moved (or the run was last resumed), for the
+   * stall check: see {@link workflowStalled}.
+   */
+  lastProgressAt?: number;
+  /**
+   * Why the stall check stopped this run. Set before its signal is aborted, so
+   * {@link completeWorkflowTask} records a failure with this reason rather than
+   * the user stop an abort otherwise means.
+   */
+  stalled?: string;
 
   /** The script's return value, once the run produced one. */
   value?: unknown;
@@ -167,6 +178,7 @@ export function updateWorkflowProgressBatch(
     task.workflowProgress.push(entry);
   }
   task.progressVersion++;
+  task.lastProgressAt = Date.now();
 
   const collapsed = collapse(task.workflowProgress);
   const { agents, logs } = collapsed;
@@ -211,6 +223,8 @@ export function resumeWorkflowTask(task: WorkflowTask, now = Date.now()): boolea
   task.status = "running";
   task.totalPausedMs = (task.totalPausedMs ?? 0) + Math.max(0, now - (task.pausedAt ?? now));
   task.pausedAt = undefined;
+  // A long pause is not silence: the stall clock starts again from here.
+  task.lastProgressAt = now;
   return true;
 }
 
@@ -225,13 +239,15 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
   // Nothing left to control, and holding the handle would let the dialog offer
   // pause on a run that has already stopped.
   task.control = undefined;
-  task.status = result.status;
+  // Stopped by the stall check, not by a person: a failure, with its reason.
+  const stalled = task.stalled !== undefined && result.status === "killed";
+  task.status = stalled ? "failed" : result.status;
   task.meta ??= result.meta;
   task.workflowName ??= result.meta.name;
   task.agentCount = Math.max(task.agentCount, result.agentCount);
   task.replayedCount = result.replayedCount;
   task.value = result.value;
-  task.error = result.error;
+  task.error = stalled ? task.stalled : result.error;
   task.failures = result.failures;
   task.endTime = Date.now();
 }
@@ -246,6 +262,22 @@ export function failWorkflowTask(task: WorkflowTask, error: string): void {
   task.status = "failed";
   task.error = error;
   task.endTime = Date.now();
+}
+
+/**
+ * Whether a running workflow has stopped responding: its progress log has not
+ * moved for `limitMs` and no agent of it is in flight.
+ *
+ * A run with a live agent is never stalled here, however quiet: each agent has
+ * a stall check of its own on the manager, whose verdict lands in this log as a
+ * failed row. What is left is a script spinning, or awaiting something that
+ * never settles, with no agent to show for it. A paused run is waiting on a
+ * person, never stalled.
+ */
+export function workflowStalled(task: WorkflowTask, now: number, limitMs: number): boolean {
+  if (limitMs <= 0 || task.status !== "running") return false;
+  if (now - (task.lastProgressAt ?? task.startTime) < limitMs) return false;
+  return !collapse(task.workflowProgress).agents.some(isLive);
 }
 
 /** The run's outcome as text, for the notification and the LLM-facing result. */

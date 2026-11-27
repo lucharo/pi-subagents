@@ -64,6 +64,16 @@ describe("documented defaults (README:441)", () => {
     }
   });
 
+  it("the stall timeout defaults to 60 minutes", async () => {
+    const { AgentManager } = await import("../src/agent-manager.js");
+    const manager = new AgentManager();
+    try {
+      expect(manager.getStallLimitMs()).toBe(60 * 60_000);
+    } finally {
+      manager.dispose();
+    }
+  });
+
   it("top-level spawns default to background, nested spawns to foreground", async () => {
     const { resolveAgentInvocationConfig } = await import("../src/invocation-config.js");
     // The setting's default (true) is what index.ts passes for top-level calls.

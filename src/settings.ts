@@ -60,6 +60,13 @@ export interface SubagentsSettings {
    * (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`), so `10` matches it.
    */
   headlessWaitMinutes?: number;
+  /**
+   * Minutes a running agent may write nothing (no streamed text, tool event or
+   * usage) before it is marked failed ("Stopped responding") and settled —
+   * `0` turns the check off, default 60. Covers Agent-tool agents, nested ones
+   * and workflow children, and a workflow run with no agent left in flight.
+   */
+  staleAgentMinutes?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
@@ -393,6 +400,7 @@ export interface SettingsAppliers {
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setHeadlessWaitMinutes: (n: number) => void;
+  setStaleAgentMinutes: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
@@ -438,11 +446,13 @@ const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const HEADLESS_WAIT_MINUTES_CEILING = 24 * 60;
 const SUBAGENT_DEPTH_CEILING = 16;
+/** A week: past that, a silent agent is not "slow" in any sense the check is for. */
+const STALE_AGENT_MINUTES_CEILING = 7 * 24 * 60;
 
 /** The settings typed as whole numbers. */
 export type NumericSettingKey =
   | "maxConcurrent" | "maxConcurrentForeground" | "maxConcurrentNested"
-  | "defaultMaxTurns" | "graceTurns" | "headlessWaitMinutes" | "maxSubagentDepth";
+  | "defaultMaxTurns" | "graceTurns" | "headlessWaitMinutes" | "staleAgentMinutes" | "maxSubagentDepth";
 
 export interface NumericBounds { min: number; max: number }
 
@@ -450,7 +460,8 @@ export interface NumericBounds { min: number; max: number }
  * The accepted range of each number setting, inclusive. Loading drops a value
  * outside it, and `/agents` → Settings refuses to type one, so a value the menu
  * saves always survives a restart. A floor of 0 is where 0 is meaningful:
- * "unlimited" for the foreground/nested caps and max turns, "nesting off" for depth.
+ * "unlimited" for the foreground/nested caps and max turns, "nesting off" for depth,
+ * "no limit" for the headless wait, "check off" for the stall limit.
  */
 export const NUMERIC_SETTING_BOUNDS: Readonly<Record<NumericSettingKey, NumericBounds>> = {
   maxConcurrent: { min: 1, max: MAX_CONCURRENT_CEILING },
@@ -459,6 +470,7 @@ export const NUMERIC_SETTING_BOUNDS: Readonly<Record<NumericSettingKey, NumericB
   defaultMaxTurns: { min: 0, max: MAX_TURNS_CEILING },
   graceTurns: { min: 1, max: GRACE_TURNS_CEILING },
   headlessWaitMinutes: { min: 0, max: HEADLESS_WAIT_MINUTES_CEILING },
+  staleAgentMinutes: { min: 0, max: STALE_AGENT_MINUTES_CEILING },
   maxSubagentDepth: { min: 0, max: SUBAGENT_DEPTH_CEILING },
 };
 
@@ -480,6 +492,7 @@ export const SETTING_DEFAULTS: { readonly [K in keyof Required<SubagentsSettings
   defaultMaxTurns: 0,
   graceTurns: 5,
   headlessWaitMinutes: 0,
+  staleAgentMinutes: 60,
   defaultJoinMode: "smart",
   backgroundByDefault: true,
   schedulingEnabled: true,
@@ -734,6 +747,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.headlessWaitMinutes === "number") appliers.setHeadlessWaitMinutes(s.headlessWaitMinutes);
+  if (typeof s.staleAgentMinutes === "number") appliers.setStaleAgentMinutes(s.staleAgentMinutes);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
