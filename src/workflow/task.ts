@@ -1,8 +1,8 @@
 /**
  * task.ts — the background record one workflow run lives in.
  *
- * A `SubagentWorkflow` tool call returns a task id immediately and the run continues
- * without it, so the run's state cannot live in the tool call's closure: the
+ * A `SubagentWorkflow` tool call returns a task id once the first agent starts (see
+ * {@link WORKFLOW_HANDOFF_MS}) and the run continues without it, so the run's state cannot live in the tool call's closure: the
  * inline card, the completion notification and (later) the `/agents → Workflows` dialog
  * all read it after `execute` has returned. This is that record, shaped after
  * Claude Code's `local_workflow` task so the fields line up with what the
@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { activePhaseLabel, collapse, elapsedMs, isLive, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import { activePhaseLabel, collapse, elapsedMs, formatDuration, isLive, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -362,4 +362,48 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     `<usage><total_tokens>${task.totalTokens}</total_tokens><tool_uses>${task.totalToolCalls}</tool_uses><duration_ms>${elapsedMs(task, now)}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join("\n");
+}
+
+/**
+ * The longest a `SubagentWorkflow` call holds its result before handing the run
+ * to the background.
+ *
+ * The call returns at the first of: a live agent starting, the run settling, or
+ * this window passing. A script that throws on its first lines (bad `args`, a
+ * typo) therefore fails inside the tool result, where the model can fix it in
+ * the same turn, rather than in a notification that arrives after it has moved
+ * on. Agents are what cost time and money, so once one starts the run goes to
+ * the background exactly as before.
+ */
+export const WORKFLOW_HANDOFF_MS = 2_000;
+
+/** Whether this progress batch shows an agent starting live, as opposed to queuing or replaying from a journal. */
+export function startsLiveAgent(entries: readonly WorkflowEntry[]): boolean {
+  return entries.some(entry => entry.type === "workflow_agent" && entry.startedAt !== undefined && !entry.cached);
+}
+
+/** The tool result for a run that settled before it was handed to the background: no notification follows it. */
+export function formatSettledEarly(task: WorkflowTask, now = Date.now()): string {
+  const name = task.workflowName ?? task.id;
+  const took = formatDuration(elapsedMs(task, now));
+  const head =
+    task.status === "completed" ? `Workflow "${name}" completed in ${took}.`
+    : task.status === "killed" ? `Workflow "${name}" was stopped after ${took}.`
+    : `Workflow "${name}" failed after ${took}. Nothing is running in the background.`;
+  const lines = [
+    `${head} No notification will follow.`,
+    `Task ID: ${task.id}`,
+    task.scriptPath ? `Script: ${task.scriptPath}` : undefined,
+    task.replayedCount > 0 ? `Replayed ${task.replayedCount} recorded call(s) from ${task.resumedFrom ?? "an earlier run"}.` : undefined,
+    "",
+    task.status === "failed" ? `Error: ${workflowResultText(task)}` : `Result:\n${workflowResultText(task)}`,
+  ];
+  if (task.status === "failed") {
+    lines.push(
+      "",
+      "Fix the script or `args` and call SubagentWorkflow again" +
+        (task.agentCount > 0 ? `, with resumeFromRunId: "${task.id}" to reuse the agent calls that settled.` : "."),
+    );
+  }
+  return lines.filter(line => line !== undefined).join("\n");
 }

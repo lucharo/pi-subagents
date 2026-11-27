@@ -31,7 +31,7 @@ You do not have to say "workflow" — the model picks the tool — but saying it
 
 ### 2. Read what came back
 
-The tool returns immediately. The run continues in the background and notifies you when it is done.
+The tool returns as soon as the first agent starts (at most 2 s). The run continues in the background and notifies you when it is done. A script that fails before then, typically on its first lines over bad `args`, returns its error here instead (`Workflow "…" failed after 120ms. Nothing is running in the background.`), and a run that finishes without starting an agent returns its result here; neither sends a notification.
 
 ```text
 Workflow "auth-audit" started in the background.
@@ -426,6 +426,9 @@ See [`compose.js`](../examples/workflows/compose.js).
 
 ## Troubleshooting
 
+**The call came back as `failed after …` instead of `started`.**
+The script threw before its first agent started: usually `args` was not the data the script expected, or a typo. Nothing is running. Fix the script or `args` and call again; if some agent calls had already settled (a resume replaying them), the message names the run id to pass as `resumeFromRunId`.
+
 **The run failed with `… unavailable in workflow scripts (breaks resume)`.**
 The script called `Date.now()`, `new Date()`, `Date()` or `Math.random()` — through `globalThis` too. A script that varies run to run cannot be replayed from its journal, so these throw. Use the loop index for ids, pass timestamps in through `args`, or stamp them after the workflow returns. This most often bites pasted-in helper code, and it throws at the line that calls it — *after* you have already paid for the preceding agents.
 
@@ -506,6 +509,7 @@ Different:
 - **An unknown `effort` throws** at the call. Claude Code ignores it and uses the default effort.
 - **An unknown option key throws** at the call, by name. Claude Code ignores it.
 - **`parallel` and `pipeline` propagate a fatal run error** — a cap breach, an unusable `schema`, or a `resume` label no agent has completed under — instead of folding it into a `null`. Claude Code throws the same schema error at `agent()`, but inside `parallel` or `pipeline` it becomes a `null`.
+- **The call holds its result until the first agent starts**, for at most 2 s, where Claude Code returns at once. A script that throws before then fails in the tool result rather than in a later notification, and a run that finishes without starting an agent returns its result there, with no notification.
 - If both extensions are loaded, this one **stands down** rather than offering the model two orchestrators.
 
 Additions on this side: `gate`, `resume`, `effort: "minimal"`, `agentError(label)`, the journal entry's `error`, and the un-awaited-`agent()` check. All are optional, which is what keeps a Claude Code script portable.

@@ -18,6 +18,7 @@ import {
   failWorkflowTask,
   pauseWorkflowTask,
   resumeWorkflowTask,
+  startsLiveAgent,
   updateWorkflowProgressBatch,
   type WorkflowTask,
   workflowStalled,
@@ -228,5 +229,19 @@ describe("a run that stops responding", () => {
     completeWorkflowTask(task, { status: "completed", value: 1, meta, progress: [], agentCount: 0, replayedCount: 0, failures: [] });
     expect(task.status).toBe("completed");
     expect(task.error).toBeUndefined();
+  });
+});
+
+describe("startsLiveAgent", () => {
+  const entry = (extra: Partial<Extract<WorkflowEntry, { type: "workflow_agent" }>>): WorkflowEntry =>
+    ({ type: "workflow_agent", index: 0, label: "a", state: "start", queuedAt: 1_000, ...extra });
+
+  it("is true for an agent that started live, and only then", () => {
+    expect(startsLiveAgent([entry({ startedAt: 2_000 })])).toBe(true);
+    // Queued, not yet given a slot.
+    expect(startsLiveAgent([entry({})])).toBe(false);
+    // Replayed from a resume journal: nothing is running.
+    expect(startsLiveAgent([entry({ startedAt: 2_000, cached: true, state: "done" })])).toBe(false);
+    expect(startsLiveAgent([{ type: "workflow_log", message: "hi" }])).toBe(false);
   });
 });

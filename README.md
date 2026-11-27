@@ -553,7 +553,7 @@ Launch a sub-agent.
 
 ### `SubagentWorkflow`
 
-Run a deterministic script that orchestrates many subagents. Returns a task id immediately; the run continues in the background and notifies on completion.
+Run a deterministic script that orchestrates many subagents. Returns a task id as soon as the first agent starts (at most 2 s); the run continues in the background and notifies on completion. A script that fails before then, or finishes without starting an agent, returns its outcome in the tool result instead, with no notification.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

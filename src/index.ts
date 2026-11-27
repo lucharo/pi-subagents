@@ -94,7 +94,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId, workflowStalled } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatSettledEarly, formatWorkflowNotification, resolveResumeTarget, startsLiveAgent, updateWorkflowProgressBatch, WORKFLOW_HANDOFF_MS, type WorkflowTask, workflowResultText, workflowRunId, workflowStalled } from "./workflow/task.js";
 import { workflowToolDescription } from "./workflow/tool-description.js";
 import { toWorkflowDetail, toWorkflowInfo, workflowArgs, workflowResult } from "./workflow-info.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
@@ -2679,9 +2679,10 @@ Terse command-style prompts produce shallow, generic work.
    * either way. Never rejects: a run that cannot start (bad `meta`, oversized
    * source, non-JSON `args`) is a failed workflow, and both callers here are
    * detached — a rejection would surface as an unhandled one, and would end a
-   * headless drain's wait early.
+   * headless drain's wait early. `onLiveAgent` fires on every progress batch in
+   * which an agent actually starts (not one replayed from a journal).
    */
-  async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
+  async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask, onLiveAgent?: () => void): Promise<void> {
     // This function must never reject (both callers are detached). The payload
     // is built inside the guard as well as emitted there: a stale `pi` throws
     // on emit after a session replacement, and either throw would otherwise
@@ -2714,6 +2715,7 @@ Terse command-style prompts produce shallow, generic work.
           if (entries.length === 0) return;
           updateWorkflowProgressBatch(task, entries);
           workflowCards.request(task.id);
+          if (onLiveAgent && startsLiveAgent(entries)) onLiveAgent();
         },
         // The dialog's pause / skip / retry keys run through this; it is dropped
         // again when the task settles.
@@ -2933,9 +2935,37 @@ Terse command-style prompts produce shallow, generic work.
       widget.update();
       fleet.update();
 
-      // Background, like Claude Code: the id comes back now and the run keeps
-      // going without the tool call.
-      trackWorkflowRun(runWorkflowTask(ctx, task).then(() => notifyWorkflowFinished(task)));
+      // Held until the first live agent starts, the run settles, or the handoff
+      // window passes (WORKFLOW_HANDOFF_MS). A script that throws on its first
+      // lines then fails in this result, where the model fixes it in the same
+      // turn, instead of in a notification that lands after it has moved on.
+      let handedOff = false;
+      let liveStarted!: () => void;
+      const live = new Promise<"live">(resolve => { liveStarted = () => resolve("live"); });
+      const settled = runWorkflowTask(ctx, task, () => liveStarted());
+      // Background from the handoff on, like Claude Code: the run keeps going
+      // without the tool call and reports back through the agent channel.
+      trackWorkflowRun(settled.then(() => { if (handedOff) notifyWorkflowFinished(task); }));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        settled,
+        live,
+        new Promise<void>(resolve => { timer = setTimeout(resolve, WORKFLOW_HANDOFF_MS); }),
+      ]);
+      clearTimeout(timer);
+      const nothingToReplay = task.resumedFrom === undefined && params.resumeFromRunId !== undefined
+        ? `Nothing to replay from ${params.resumeFromRunId} — every agent runs live.\n`
+        : "";
+      // Settled inside the window, or in the same tick its first agent started:
+      // the result is this call's, and no notification follows it.
+      if (task.endTime !== undefined) {
+        redrawWorkflowSurfaces(task);
+        return {
+          content: [{ type: "text" as const, text: nothingToReplay + formatSettledEarly(task) }],
+          details: { taskId: runId },
+        };
+      }
+      handedOff = true;
 
       return {
         content: [{
@@ -2946,9 +2976,7 @@ Terse command-style prompts produce shallow, generic work.
             (task.scriptPath ? `Script: ${task.scriptPath}\n` : "") +
             (task.resumedFrom !== undefined
               ? `Resuming ${task.resumedFrom}: ${task.replay?.length ?? 0} recorded call(s) available to replay.\n`
-              : params.resumeFromRunId !== undefined
-                ? `Nothing to replay from ${params.resumeFromRunId} — every agent runs live.\n`
-                : "") +
+              : nothingToReplay) +
             `\nYou will be notified when it finishes — do NOT poll or sleep waiting for it.\n` +
             `To iterate, edit the script file and call SubagentWorkflow again with scriptPath.`,
         }],

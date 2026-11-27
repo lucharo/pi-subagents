@@ -138,15 +138,26 @@ describe("/agents → Workflows", () => {
   });
 
   describe("with runs in the session", () => {
-    const script = (name: string) =>
-      `export const meta = { name: "${name}", description: "d" };\nreturn 1;\n`;
+    const script = (name: string, body = "return 1;\n") =>
+      `export const meta = { name: "${name}", description: "d" };\n${body}`;
+    let shutdown: (() => Promise<void>) | undefined;
+    afterEach(async () => {
+      await shutdown?.();
+      shutdown = undefined;
+    });
 
-    /** Boot, then start `count` workflows so the session has tasks to inspect. */
-    async function withRuns(count: number) {
+    /**
+     * Boot, then start `count` workflows so the session has tasks to inspect.
+     * `live` runs never return, so there is a running run to stop or pause; the
+     * call hands each to the background once its handoff window passes.
+     */
+    async function withRuns(count: number, { live = false } = {}) {
       const booted = bootCommand();
       const runCtx = ctx({ cwd: hermetic.dir });
+      shutdown = async () => { await booted.lifecycle.get("session_shutdown")?.({}, runCtx); };
+      const body = live ? "await new Promise(() => {});\n" : undefined;
       for (let i = 0; i < count; i++) {
-        await booted.tools.get("SubagentWorkflow").execute(`tc-${i}`, { script: script(`wf-${i}`) }, undefined, undefined, runCtx);
+        await booted.tools.get("SubagentWorkflow").execute(`tc-${i}`, { script: script(`wf-${i}`, body) }, undefined, undefined, runCtx);
       }
       return booted;
     }
@@ -176,7 +187,7 @@ describe("/agents → Workflows", () => {
 
     it("actually aborts the run when stopped from the dialog", async () => {
       // The consequential action: it must abort, not merely look like it did.
-      const { command } = await withRuns(1);
+      const { command } = await withRuns(1, { live: true });
       const ui = commandCtx();
       await command.handler("", ui.context);
       const dialog = ui.built[0] as { handleInput(data: string): void };
@@ -185,7 +196,7 @@ describe("/agents → Workflows", () => {
     });
 
     it("does not re-announce a stop for an already-aborted run", async () => {
-      const { command } = await withRuns(1);
+      const { command } = await withRuns(1, { live: true });
       const ui = commandCtx();
       await command.handler("", ui.context);
       const dialog = ui.built[0] as { handleInput(data: string): void };
@@ -222,7 +233,7 @@ describe("/agents → Workflows", () => {
     it("pauses and resumes the run from the dialog", async () => {
       // The whole path: the key reaches the task, the task reaches the run's
       // control surface, and the run's new state comes back out in the footer.
-      const { command } = await withRuns(1);
+      const { command } = await withRuns(1, { live: true });
       const ui = commandCtx();
       await command.handler("", ui.context);
       const dialog = ui.built[0] as { handleInput(d: string): void; render(w: number): string[] };

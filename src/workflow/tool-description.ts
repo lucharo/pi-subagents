@@ -37,6 +37,8 @@
  *   - the result labels the run id `Task ID`.
  *   - `effort` inherits the agent definition's level, then the parent's.
  *   - `isolation` removes the worktree on settle, changes kept on a branch.
+ *   - the call holds its result until the first live agent starts (at most
+ *     2 s), so a script that throws on its first lines fails in the result.
  * Additions: `gate`, `resume`, `effort: "minimal"`, `disallowedTools`, the
  * saved-workflow directories, and the reject-unknown-options guarantee.
  *
@@ -71,7 +73,7 @@ const WORKFLOW_SKILL_INLINE_LEAD = "Do not load the `workflow-authoring` skill: 
  * once it is running. `workflow-tool-description.test.ts` pins the parts of
  * the pair that can drift; `workflow-skill.test.ts` pins the split.
  */
-export const fullWorkflowToolDescription = `Execute a workflow script that orchestrates multiple subagents deterministically. Workflows run in the background — this tool returns immediately with a task ID, and you are notified when the workflow completes. Use /agents → Workflows to watch live progress.
+export const fullWorkflowToolDescription = `Execute a workflow script that orchestrates multiple subagents deterministically. Workflows run in the background — this tool returns with a task ID as soon as the first agent starts, and you are notified when the workflow completes. A script that fails or finishes before then returns its outcome here instead, and no notification follows. Use /agents → Workflows to watch live progress.
 
 ONLY call this tool when the user has explicitly opted into multi-agent orchestration. Workflows can spawn dozens of agents and consume a large amount of tokens; the user must request that scale, not have it inferred. Explicit opt-in means one of:
 - The user directly asked you to run a workflow or use multi-agent orchestration in their own words ("use a workflow", "run a workflow", "fan out agents", "orchestrate this with subagents"). The ask must be in the user's words — a task that would merely benefit from a workflow does not count.
