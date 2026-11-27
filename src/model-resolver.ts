@@ -33,6 +33,29 @@ export function describeModel(
 }
 
 /**
+ * The line an Agent result starts with when the model that runs is not the one
+ * `input` asked for, or undefined when it is. `resolved` is what `input`
+ * resolved to, or undefined when it resolved to nothing and the run fell back
+ * to `fallback`, the session's model. A fuzzy name (`"haiku"`) or another
+ * spelling of the same id resolving is not a substitution; a `provider/id`
+ * taken from another provider (step 3 of {@link resolveModel}) is.
+ */
+export function modelSubstitutionNote(
+  input: string,
+  resolved: { provider: string; id: string } | undefined,
+  fallback: { provider: string; id: string } | undefined,
+): string | undefined {
+  const ran = resolved ?? fallback;
+  if (ran === undefined) return undefined;
+  if (resolved === undefined) {
+    return `Note: no model "${input}" is available here, so this ran on the session's model, ${ran.provider}/${ran.id}.\n\n`;
+  }
+  const slash = input.indexOf("/");
+  if (slash === -1 || input.slice(0, slash).toLowerCase() === resolved.provider.toLowerCase()) return undefined;
+  return `Note: "${input}" is not available here, so this ran on ${resolved.provider}/${resolved.id}.\n\n`;
+}
+
+/**
  * Resolve a model string to a Model instance.
  * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
  * Returns the Model on success, or an error message string on failure.
