@@ -32,3 +32,16 @@ pi-coding-agent and pi-tui, and `typebox` is a peer too. That is why #21, an edg
 as not applicable. Check `package.json` again after each upstream sync.
 
 Sources: `package.json` `peerDependencies`; #21; #15.
+
+## What does a child inherit from its parent's prompt, and which skills does it see?
+
+**Short answer:** An append-mode child inherits the parent's rendered prompt up to, but not including, the parent's
+`skills` section (or its `cwd` section when there are no skills). Everything Pi renders after that, the `cwd` section and
+every section an extension adds during a turn, is never inherited. The child renders its own `skills` from its agent's
+`skills:` setting, its own `cwd` and its own extension sections. So a parent-only section such as a skills shortlist
+reaches a child only when an extension in the child adds it again. Children run inside the parent's Pi process
+(`createAgentSession`), so state an extension keeps process-wide is visible to them. A listener on the child-resources
+request that drops the skills list (fluide's pi-subagent-profile does when the child keeps the `skills` tool,
+thenewcomputer/fluide-plugins#1468) asks `keepsTool` first, because the parent's tools say nothing about what this child keeps.
+
+Sources: `src/prompts.ts`, `inheritableParentPrompt`; README.md, the child-resources table (`keepsTool`); #27.
