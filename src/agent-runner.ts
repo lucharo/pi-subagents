@@ -960,6 +960,13 @@ export function trackRunPromptOptions(pi: Pick<ExtensionAPI, "on">): void {
   });
 }
 
+/** Forget `pi`'s run options once its run settles or its session shuts down: a settled run's overrides are gone (Pi
+ * goes back to its base prompt), so a spawn between runs (an RPC, a schedule) uses each tool's own bullets. Snapshots
+ * children already took keep theirs. Called from the extension's own agent_settled and session_shutdown handlers. */
+export function forgetRunPromptOptions(pi: object): void {
+  runPromptOptions.delete(pi);
+}
+
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((g): g is string => typeof g === "string") : []);
 
 /** A copy of the current run's per-tool rule bullets on `pi`, taken when a child is spawned, so a later run of the
@@ -1044,14 +1051,15 @@ export async function runAgent(
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
   const configCwd = options.configCwd ?? effectiveCwd;
 
-  const env = await detectEnv(options.pi, effectiveCwd);
-
   // Get parent system prompt for append-mode agents, without the sections the
-  // child session renders itself (skills, cwd, extension sections).
+  // child session renders itself (skills, cwd, extension sections), and the run's
+  // per-tool rule bullets it was rendered from: both before the first await, so a
+  // later parent run cannot change either while the child starts. No run in
+  // progress: {} (each tool's own bullets).
   const parentSystemPrompt = inheritableParentPrompt(ctx.getSystemPrompt(), ctx.cwd);
-  // The run's per-tool rule bullets that prompt was rendered from, taken now: the loader awaits below, and a later
-  // parent run could change them meanwhile.
-  const parentRunGuidelines = snapshotRunGuidelines(options.pi);
+  const parentRunGuidelines = snapshotRunGuidelines(options.pi) ?? {};
+
+  const env = await detectEnv(options.pi, effectiveCwd);
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};

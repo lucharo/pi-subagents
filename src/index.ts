@@ -20,7 +20,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { AgentManager, isTopLevelAgent, stalledMessage } from "./agent-manager.js";
 import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findAgentRecordEntry, reopenTarget } from "./agent-record-entry.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent, trackRunPromptOptions } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent, trackRunPromptOptions, forgetRunPromptOptions } from "./agent-runner.js";
 import { formatAgentTypeList, getAgentConfig, getAvailableTypes, getConfig, getFallbackSubagent, getModelLabelFromConfig, getToolDescriptionMode, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent, setToolDescriptionMode } from "./agent-types.js";
 import { getCacheRetention, setCacheRetention } from "./cache-retention.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -1126,6 +1126,7 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async (event, ctx) => {
+    forgetRunPromptOptions(pi);
     // `pi -p` with no prompt never starts a run, so a flag workflow has no turn
     // to report into and is stopped below. Claude Code's `-p` refuses to run
     // without input; say so rather than stop it silently.
@@ -1521,7 +1522,7 @@ export default function (pi: ExtensionAPI) {
     outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
   });
   pi.on("agent_end", () => outbox.onAgentEnd());
-  pi.on("agent_settled", () => outbox.onAgentEnd());
+  pi.on("agent_settled", () => { forgetRunPromptOptions(pi); outbox.onAgentEnd(); });
 
   // ---- Headless drain (print / JSON mode) ----
   // Nothing follows a headless parent's run: pi prints its last message and

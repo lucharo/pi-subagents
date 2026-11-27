@@ -163,6 +163,7 @@ import {
   setDefaultMaxTurns,
   setGraceTurns,
   setRememberAgents,
+  forgetRunPromptOptions,
   readParentTools,
   snapshotRunGuidelines,
   trackRunPromptOptions,
@@ -511,18 +512,59 @@ describe("agent-runner final output capture", () => {
   });
 
   it("a child judges its inherited prompt by the bullets of the run that spawned it, not a later run's", () => {
+    const handlers = new Map<string, Array<(e: any) => void>>();
+    const fire = (event: string, e: any = {}) => { for (const h of handlers.get(event) ?? []) h(e); };
+    const parentPi = {
+      on: (event: string, h: (e: any) => void) => { handlers.set(event, [...(handlers.get(event) ?? []), h]); },
+      getAllTools: () => [{ name: "spawn_session", promptGuidelines: ["Use spawn_session"] }],
+    } as any;
+    trackRunPromptOptions(parentPi);
+    fire("before_agent_start", { systemPromptOptions: { toolGuidelines: { spawn_session: ["Prefer a subagent"] } } });
+    const snapshot = snapshotRunGuidelines(parentPi);
+    // the parent's next run starts while the child is still loading
+    fire("before_agent_start", { systemPromptOptions: { toolGuidelines: { spawn_session: [] } } });
+    expect(readParentTools(parentPi, snapshot)).toEqual([{ name: "spawn_session", promptGuidelines: ["Prefer a subagent"] }]);
+    expect(readParentTools(parentPi)).toEqual([{ name: "spawn_session", promptGuidelines: [] }]);
+    // once that run settles, a spawn between runs uses each tool's own bullets, and a spawn taken with no run ({})
+    // keeps them even if a run starts later
+    forgetRunPromptOptions(parentPi);
+    expect(snapshotRunGuidelines(parentPi)).toBeUndefined();
+    expect(readParentTools(parentPi)).toEqual([{ name: "spawn_session", promptGuidelines: ["Use spawn_session"] }]);
+    fire("before_agent_start", { systemPromptOptions: { toolGuidelines: { spawn_session: [] } } });
+    expect(readParentTools(parentPi, {})).toEqual([{ name: "spawn_session", promptGuidelines: ["Use spawn_session"] }]);
+  });
+
+  it("a child keeps the spawning run's prompt bullets when the parent starts another run during its start-up", async () => {
+    const { detectEnv } = await import("../src/env.js");
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    const parent = "<rules>\n- Prefer a subagent\n- Be concise in your responses\n</rules>";
+    const parentCtx = { ...ctx, getSystemPrompt: vi.fn(() => parent) };
     const handlers: Array<(e: any) => void> = [];
     const parentPi = {
       on: (event: string, h: (e: any) => void) => { if (event === "before_agent_start") handlers.push(h); },
+      events: { emit(channel: string, data: any) { if (channel === "subagents:child-resources") data.excludeTools.push("spawn_session"); } },
       getAllTools: () => [{ name: "spawn_session" }],
     } as any;
     trackRunPromptOptions(parentPi);
     for (const h of handlers) h({ systemPromptOptions: { toolGuidelines: { spawn_session: ["Prefer a subagent"] } } });
-    const snapshot = snapshotRunGuidelines(parentPi);
-    // the parent's next run starts while the child is still loading
+    let release!: () => void;
+    vi.mocked(detectEnv).mockImplementationOnce(() => new Promise((r) => { release = () => r({ isGitRepo: false, branch: "", platform: "linux" } as any); }));
+    vi.mocked(buildAgentPrompt).mockImplementationOnce((_c, _cwd, _env, inherited) => inherited ?? "");
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ promptMode: "append", systemPrompt: "" }));
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ promptMode: "append" }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+
+    const running = runAgent(parentCtx, "general-purpose", "go", { pi: parentPi });
+    // the parent's next run drops the bullet's owner before the child has finished starting
     for (const h of handlers) h({ systemPromptOptions: { toolGuidelines: { spawn_session: [] } } });
-    expect(readParentTools(parentPi, snapshot)).toEqual([{ name: "spawn_session", promptGuidelines: ["Prefer a subagent"] }]);
-    expect(readParentTools(parentPi)).toEqual([{ name: "spawn_session", promptGuidelines: [] }]);
+    release();
+    await running;
+
+    const seen = createAgentSession.mock.calls[0][0].resourceLoader.getSystemPrompt();
+    expect(seen).not.toContain("Prefer a subagent");
+    expect(seen).toContain("- Be concise in your responses");
   });
 
   it("marks a workflow child so its prompt says the final text is the return value", async () => {
