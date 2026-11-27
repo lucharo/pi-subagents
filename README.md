@@ -982,7 +982,7 @@ An agent's `tokens` and `usage` include the spend of every agent below it, so ad
 
 ### Trimming what a child gets: `subagents:child-resources`
 
-Before each spawn that is not `isolated`, pi-subagents emits `subagents:child-resources` on the parent's `pi.events` with a payload that listeners change in place. `emit` runs listeners synchronously, so their answer is read as soon as it returns. With no listener, nothing changes.
+Before each spawn that is not `isolated`, pi-subagents emits `subagents:child-resources` on the `pi.events` of the session it runs in (the top session's, also for a nested child) with a payload that listeners change in place. `emit` runs listeners synchronously, so their answer is read as soon as it returns. With no listener, nothing changes.
 
 | Field | Default | What a listener sets | Applied when |
 |-------|---------|----------------------|--------------|
@@ -991,9 +991,12 @@ Before each spawn that is not `isolated`, pi-subagents emits `subagents:child-re
 | `excludeTools` | `[]` | tool names, dropped as `disallowed_tools:` entries are | always, except a tool the agent file names itself (`tools:` built-ins, `ext:ext/tool`) |
 | `skillsCatalog` | `true` | `false`: no skills catalog in the child's prompt (the inherited parent prompt never carries one); skills still load, so `/skill:name` and a `skills: [names]` preload work | the agent inherits every skill (`skills: true`) |
 | `promptNote` | — | one line appended to the child's prompt (whitespace folded, at most 500 characters) | always |
+| `parentSessionId` | — | read only: the session id of the context that starts the child (the parent subagent's, for a nested child); missing when that context has no session | — |
 | `keepsTool(name)` | — | read only: whether the child can have that tool. No when its agent file denies it (`disallowed_tools:`), when it is a built-in the agent lacks, when an `ext:` allowlist does not name it, or when the agent does not inherit every extension | — |
 
 A listener that leaves the catalog out because a tool stands in for it (a `skills` tool that searches and reads skills) should ask `keepsTool` first: the parent's own tools say nothing about what this child keeps.
+
+The child starts later in the same async call as the emit, so a listener that hands the child something of its parent's (looked up by `parentSessionId`) can enter it in an `AsyncLocalStorage` there and read it in the child's `session_start`; a session started by another spawn never sees it.
 
 A nested child (an agent with `allowed_subagents` spawning its own) is asked on the top-level session's bus as well: the top-level session's listeners decide for the whole tree, since a child loads its extensions from the same packages.
 
