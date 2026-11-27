@@ -150,11 +150,13 @@ vi.mock("../src/nested-tools.js", async (importOriginal) => ({
 import {
   extensionCanonicalName,
   extensionCanonicalNames,
+  forgetRunPromptOptions,
   getAgentConversation,
   getDefaultMaxTurns,
   getGraceTurns,
   parseExtensionsSpec,
   parseExtSelectors,
+  readParentTools,
   resolveDefaultModel,
   resolveEffectiveMaxTurns,
   resumeAgent,
@@ -163,8 +165,6 @@ import {
   setDefaultMaxTurns,
   setGraceTurns,
   setRememberAgents,
-  forgetRunPromptOptions,
-  readParentTools,
   snapshotRunGuidelines,
   trackRunPromptOptions,
 } from "../src/agent-runner.js";
