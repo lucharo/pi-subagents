@@ -587,9 +587,15 @@ export class AgentManager {
 
     // A reclaimed id must not be live: the record would replace the one in the
     // map, orphaning its run beyond the reach of stop and `abortAll()`.
-    // Callers reopen only what they found evicted; this keeps that true.
-    if (options.reclaim?.id !== undefined && this.agents.has(options.reclaim.id)) {
-      throw new Error(`Agent ${options.reclaim.id} is still in memory, so it cannot be reopened from its saved session.`);
+    // Callers reopen only what they found evicted, or a settled workflow child
+    // whose session was shut down (`releaseSettledSession`) — a record with no
+    // session and nothing still running, so replacing it orphans nothing.
+    const held = options.reclaim?.id !== undefined ? this.agents.get(options.reclaim.id) : undefined;
+    if (
+      held !== undefined &&
+      (held.session !== undefined || held.status === "running" || held.status === "queued" || this.isSettling(held.id))
+    ) {
+      throw new Error(`Agent ${held.id} is still in memory, so it cannot be reopened from its saved session.`);
     }
     const id = options.reclaim?.id ?? randomUUID().slice(0, 17);
     const abortController = new AbortController();
@@ -1023,6 +1029,7 @@ export class AgentManager {
         this.abortOwnedChildren(id);
 
         this.settleRun(record, true);
+        this.releaseSettledSession(record);
         return responseText;
       })
       .catch(async (err) => {
@@ -1051,7 +1058,11 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, false);
+        try {
+          this.settleRun(record, false);
+        } finally {
+          this.releaseSettledSession(record);
+        }
         return "";
       });
 
@@ -1106,6 +1117,27 @@ export class AgentManager {
     // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
     // about reachability, and matching the old condition needs no such claim.
     if (record.isBackground || pool !== undefined) this.drainQueue();
+  }
+
+  /**
+   * Shut a settled workflow child's session down and keep only its record:
+   * status, result, usage, timings and the path of its session file. A run can
+   * spawn hundreds of children, and holding each one's live session — its
+   * extension instances and the timers they armed, its tools, its messages —
+   * until the ten-minute sweep kept a whole fan-out alive at once. Its
+   * extensions get their `session_shutdown`, as on eviction.
+   *
+   * Workflow children only: a top-level agent is one the user started and may
+   * resume or open, and the sweep already bounds those. Nothing a script can
+   * do with a finished child is lost: its host reopens the session file on
+   * `resume` (`reopenAgent` in `workflow/host.ts`), and the inspector and the
+   * conversation viewer read it back from that file.
+   */
+  private releaseSettledSession(record: AgentRecord): void {
+    if (record.workflowId === undefined || record.session === undefined) return;
+    const session = record.session;
+    record.session = undefined;
+    void shutdownChildSession(session);
   }
 
   /**

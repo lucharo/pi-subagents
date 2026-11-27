@@ -5,10 +5,10 @@
  * matching Claude Code's task output file format.
  */
 
-import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, type AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
 
 /**
  * Project/global default for writing a subagent's `.output` transcript; a custom
@@ -58,6 +58,23 @@ export function sessionTaskDir(cwd: string, sessionId: string): string {
   const dir = join(root, encoded, sessionId, "tasks");
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/**
+ * A settled agent's conversation read back from its pi session file, for a
+ * reader whose live session is gone: a workflow child's is shut down as soon
+ * as it settles. Undefined when there is no file or it cannot be read.
+ */
+export function readSavedConversation(
+  sessionFile: string | undefined,
+): { messages: AgentSession["messages"]; cwd: string } | undefined {
+  if (sessionFile === undefined || !existsSync(sessionFile)) return undefined;
+  try {
+    const saved = SessionManager.open(sessionFile);
+    return { messages: saved.buildSessionContext().messages, cwd: saved.getCwd() };
+  } catch {
+    return undefined;
+  }
 }
 
 /** Create the output file path, ensuring the directory exists. */

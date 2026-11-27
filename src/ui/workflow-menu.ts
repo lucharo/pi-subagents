@@ -15,6 +15,7 @@
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { readSavedConversation } from "../output-file.js";
 import type { AgentRecord } from "../types.js";
 import { type AgentDetail, agentDetailFromMessages, displayText } from "../workflow/agent-detail.js";
 import { pauseWorkflowTask, resumeWorkflowTask, type WorkflowTask } from "../workflow/task.js";
@@ -65,16 +66,29 @@ function recordOutcome(record: AgentRecord): string | undefined {
  * its source on every 80ms spinner frame, and re-folding a long transcript
  * that often would be waste. The outcome is read every time: the manager
  * appends a worktree's merge note to `result` after both have settled.
+ *
+ * A settled child has no live session — the manager shuts it down as the child
+ * settles — so its transcript is read back from its session file, once per
+ * settle rather than once per frame.
  */
 export function createAgentDetailSource(getRecord: (id: string) => AgentRecord | undefined): (id: string) => AgentDetail | undefined {
   const cache = new Map<string, { key: string; folded: AgentDetail; detail: AgentDetail }>();
   return id => {
     const record = getRecord(id);
-    const messages = record?.session?.messages;
-    if (record === undefined || messages === undefined) return undefined;
-    const key = `${messages.length}:${record.status}`;
+    if (record === undefined) return undefined;
+    const live = record.session?.messages;
+    const settled = record.status !== "running" && record.status !== "queued";
+    if (live === undefined && !settled) return undefined;
+    const key = live !== undefined ? `${live.length}:${record.status}` : `saved:${record.status}:${record.completedAt}`;
     const hit = cache.get(id);
-    const folded = hit?.key === key ? hit.folded : agentDetailFromMessages(messages);
+    let folded: AgentDetail;
+    if (hit?.key === key) {
+      folded = hit.folded;
+    } else {
+      const messages = live ?? readSavedConversation(record.sessionFile)?.messages;
+      if (messages === undefined) return undefined;
+      folded = agentDetailFromMessages(messages);
+    }
     const outcome = recordOutcome(record) ?? folded.outcome;
     if (hit?.folded === folded && hit.detail.outcome === outcome) return hit.detail;
     const detail: AgentDetail = { ...folded, ...(outcome !== undefined ? { outcome } : {}) };

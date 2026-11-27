@@ -12,6 +12,10 @@
  * the one part of the fleet with no way to read what they did.
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
@@ -26,13 +30,25 @@ import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extensio
 /** The child's conversation; a test that needs it to overflow the viewer fills it. */
 let sessionMessages: unknown[] = [];
 
-/** Enough of a pi session for the manager to keep, and the viewer to render. */
-const fakeSession = () => ({
-  dispose: vi.fn(),
-  subscribe: vi.fn(() => vi.fn()),
-  messages: sessionMessages,
-  getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 } }),
-});
+/** Where the child's conversation is saved: the viewer reads a finished child's from there. */
+let sessionDir: string;
+
+/**
+ * Enough of a pi session for the manager to keep. A workflow child's session is
+ * shut down as it settles, so the viewer opens on the conversation saved to its
+ * session file, which holds `sessionMessages`.
+ */
+const fakeSession = () => {
+  const saved = SessionManager.create(sessionDir, sessionDir);
+  for (const message of sessionMessages) saved.appendMessage(message as any);
+  return {
+    dispose: vi.fn(),
+    subscribe: vi.fn(() => vi.fn()),
+    messages: sessionMessages,
+    sessionManager: { getSessionFile: () => saved.getSessionFile() },
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 } }),
+  };
+};
 
 /** One overlay the extension asked `ui.custom` for, held open like a real one. */
 interface OpenOverlay {
@@ -87,7 +103,8 @@ describe("the inspector opens a workflow agent's conversation", () => {
 
   beforeEach(() => {
     hermetic = hermeticDir({ settings: { workflowsEnabled: true } });
-    sessionMessages = [];
+    sessionDir = mkdtempSync(join(tmpdir(), "pi-open-agent-"));
+    sessionMessages = [{ role: "user", content: "read the routes", timestamp: 1 }];
     vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
       const session = fakeSession();
       opts.onSessionCreated?.(session as any);
@@ -97,6 +114,7 @@ describe("the inspector opens a workflow agent's conversation", () => {
   afterEach(() => {
     vi.mocked(runAgent).mockReset();
     hermetic.restore();
+    rmSync(sessionDir, { recursive: true, force: true });
   });
 
   /** Boot the extension and start a one-agent run in the background. */
@@ -139,6 +157,9 @@ describe("the inspector opens a workflow agent's conversation", () => {
     // A second overlay, on the viewer's own terms — not the dialog reused.
     expect(ui.overlays[1].options.overlay).toBe(true);
     expect(ui.overlays[1].instance.constructor.name).toBe("ConversationViewer");
+    // The child has settled and its session is shut down: the conversation is
+    // read back from its session file.
+    expect(ui.overlays[1].instance.render?.(120).join("\n")).toContain("read the routes");
     // ...with the dialog hidden underneath it: the two frames size themselves
     // to different content, so the taller one's edges would show around the
     // shorter.

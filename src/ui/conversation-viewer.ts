@@ -17,6 +17,17 @@ import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./vie
 
 /** An assistant message's tool call, and the message that answers it. */
 type AgentMessage = AgentSession["messages"][number];
+
+/**
+ * What the viewer reads: a live session, or a settled agent's conversation read
+ * back from its session file. The second emits no events and has no extension
+ * runner, so its tool calls take the generic renderer.
+ */
+export type ViewerConversation = Pick<AgentSession, "messages" | "subscribe"> & {
+  sessionManager: { getCwd(): string };
+  extensionRunner?: AgentSession["extensionRunner"];
+  getToolDefinition?: AgentSession["getToolDefinition"];
+};
 type ToolCallPart = Extract<Extract<AgentMessage, { role: "assistant" }>["content"][number], { type: "toolCall" }>;
 type ToolResultPart = Extract<AgentMessage, { role: "toolResult" }>;
 
@@ -233,7 +244,7 @@ export class ConversationViewer implements Component, Focusable {
 
   constructor(
     private tui: TUI,
-    private session: AgentSession,
+    private session: ViewerConversation,
     private record: AgentRecord,
     private activity: AgentActivity | undefined,
     private theme: Theme,
@@ -899,7 +910,7 @@ export class ConversationViewer implements Component, Focusable {
         // pi's resolution for the agent's own session: builtin and extension
         // renderers, and extension overrides. `{}` for a tool no registry knows,
         // so it gets the bounded, expandable fallback rather than a raw dump.
-        this.session.extensionRunner.resolveToolRenderers(call.name, () => this.session.getToolDefinition(call.name)) ?? {},
+        this.session.extensionRunner?.resolveToolRenderers(call.name, () => this.session.getToolDefinition?.(call.name)) ?? {},
         this.tui,
         this.session.sessionManager.getCwd(),
       );

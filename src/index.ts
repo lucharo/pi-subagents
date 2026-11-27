@@ -34,7 +34,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, readSavedConversation, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -79,7 +79,7 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { createAgentsMenu } from "./ui/agents-menu.js";
-import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./ui/conversation-viewer.js";
+import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction, type ViewerConversation } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { createSettingsPage, type SettingsPageDeps } from "./ui/settings-menu.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
@@ -3301,24 +3301,37 @@ Terse command-style prompts produce shallow, generic work.
     return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
   }
 
+  /**
+   * A settled workflow child's conversation, read back from its session file:
+   * the manager shuts the child's session down as it settles. Read-only, since
+   * nothing is running to stop or steer.
+   */
+  function savedChildConversation(record: AgentRecord): ViewerConversation | undefined {
+    if (record.workflowId === undefined || record.status === "running" || record.status === "queued") return undefined;
+    const saved = readSavedConversation(record.sessionFile);
+    if (saved === undefined) return undefined;
+    return { messages: saved.messages, subscribe: () => () => {}, sessionManager: { getCwd: () => saved.cwd } };
+  }
+
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
-    if (!record.session) {
+    const live = record.session;
+    const session: ViewerConversation | undefined = live ?? savedChildConversation(record);
+    if (!session) {
       ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no session available.`, "info");
       return;
     }
 
-    const session = record.session;
     const activity = agentActivity.get(record.id);
     let overlayOptions = getConversationOverlayOptions({ mode: "regular" });
 
     await ctx.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
         overlayOptions = getConversationOverlayOptions(tui);
-        return new ConversationViewer(tui, session, record, activity, theme, done, () => {
+        return new ConversationViewer(tui, session, record, activity, theme, done, live ? () => {
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx), getFullscreenScrollbar(),
+        } : undefined, keybindings, live ? (message: string) => manager.steer(record.id, message) : undefined, showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx), getFullscreenScrollbar(),
         backgroundActionFor(record, message => ctx.ui.notify(message, "info")));
       },
       {

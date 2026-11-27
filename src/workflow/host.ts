@@ -190,9 +190,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
   /**
-   * Manager record id → what reopening that child needs once the manager has
-   * evicted it, ten minutes after it finished. A long review or a merge queue
-   * outlasts that easily, and `resume` must still reach the child (#385).
+   * Manager record id → what reopening that child needs. The manager shuts a
+   * child's session down as soon as it settles and evicts its record ten
+   * minutes later, and `resume` must still reach it after either (#385).
    * Lives exactly as long as the run, like `records`, so memory stays bounded
    * by the run itself; the manager keeps no tombstone for an owned child.
    */
@@ -237,8 +237,8 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   }
 
   /**
-   * Resume a child the manager has evicted: reopen its saved session under the
-   * same id, still owned by this run, as `Agent({ resume })` does for a
+   * Resume a settled child: reopen its saved session under the same id, still
+   * owned by this run, as `Agent({ resume })` does for an evicted
    * top-level agent. The continuation runs under the agent type's current
    * definition, like every reopen — the script's model, schema and isolation
    * for the first run are not replayed.
@@ -482,10 +482,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         const current = manager.getRecord(id);
         if (current !== undefined) onProgress?.(usageSince(current, baseline));
       }));
-      // No live session: the manager evicted the child, or it never got as far
-      // as having one. `reopenAgent` refuses the second with the reason — and a
-      // record still in memory without a session is refused by the manager,
-      // which never reopens an id that is still live.
+      // No live session: the child settled, so the manager shut its session
+      // down (or evicted it), or it never got as far as having one.
+      // `reopenAgent` refuses the second with the reason, and the manager
+      // refuses to reopen an id whose run is still going.
       if (record === undefined) return reopenAgent(id, prompt, onResolved, onProgress);
       // The resumed row is built from scratch, so it has to be told the same
       // thing the first one was — the child's session already exists, so this is
