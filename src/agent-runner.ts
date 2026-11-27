@@ -1055,6 +1055,11 @@ export async function runAgent(
     if (fileDenied.has(name) || EXCLUDED_TOOL_NAMES.includes(name)) return false;
     if (BUILTIN_TOOL_NAMES.includes(name)) return toolNames.includes(name);
     if (config.extensions !== true || config.excludeExtensions?.length) return false;
+    // bare `mcp__` entries, as the live scope reads them: only matching MCP tools, and the bridges that reach them,
+    // whatever an `ext:` allowlist says
+    const mcpPatterns = agentConfig?.mcpToolPatterns;
+    if (mcpPatterns && isMcpToolName(name)) return matchesToolPattern(name, mcpPatterns);
+    if (mcpPatterns && MCP_BRIDGE_TOOL_NAMES.has(name)) return true;
     return !extAllowlist || ownToolNames.includes(name);
   };
   const hooked = isolated ? undefined : askChildResources(options.pi, type, config, ownToolNames, childKeepsTool);

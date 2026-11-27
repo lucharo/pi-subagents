@@ -3069,6 +3069,32 @@ describe("agent-runner exclude_extensions", () => {
     expect(await spawn({ extensions: true, excludeExtensions: ["plan"] })).toMatchObject({ skills: false });
   });
 
+  it("subagents:child-resources keepsTool agrees with the live scope on bare mcp__ entries", async () => {
+    const mcp = ["mcp__srv__keep", "mcp__srv__drop", "codemode", "plan", "skills"];
+    let answer: Record<string, boolean> = {};
+    const piWithListener = {
+      events: {
+        emit(channel: string, data: any) {
+          if (channel === "subagents:child-resources") answer = Object.fromEntries(mcp.map((n) => [n, data.keepsTool(n)]));
+        },
+      },
+    } as any;
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__keep", "mcp__srv__drop", "codemode"], "/ext/plan.ts": ["plan"], "/ext/actions.ts": ["skills"] });
+    const check = async (overrides: Record<string, unknown>) => {
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      setupAgent(overrides);
+      await runAgent(ctx, "general-purpose", "go", { pi: piWithListener });
+      for (const l of listeners) l({ type: "turn_end" });
+      // what the child can call is what keepsTool said, tool by tool
+      const callable = Object.fromEntries(await Promise.all(mcp.map(async (n) => [n, (await session.agent.beforeToolCall?.({ toolCall: { name: n } }))?.block !== true])));
+      expect(answer).toEqual(callable);
+      return answer;
+    };
+    expect(await check({ extensions: true, mcpToolPatterns: ["mcp__srv__keep"] })).toEqual({ mcp__srv__keep: true, mcp__srv__drop: false, codemode: true, plan: true, skills: true });
+    expect(await check({ extensions: true, mcpToolPatterns: ["mcp__srv__keep"], extSelectors: ["ext:plan/plan"] })).toEqual({ mcp__srv__keep: true, mcp__srv__drop: false, codemode: true, plan: true, skills: false });
+  });
+
   it("subagents:child-resources excludeTools drops tools, but never one the agent file names itself", async () => {
     const piWithListener = {
       events: {
