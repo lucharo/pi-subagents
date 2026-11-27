@@ -2282,6 +2282,32 @@ describe("agent-runner async extension tool registration", () => {
     expect(session.getActiveToolNames()).toContain("mcp__srv__lookup");
   });
 
+  it("a tool another extension took out of the active set stays out after turn_end", async () => {
+    setup();
+    withExtensions({ "/ext/groups.ts": ["group_switch", "heavy_click", "heavy_type"] });
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+    expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["group_switch", "heavy_click", "heavy_type"]));
+
+    // An extension that loads a heavy group only on demand hides it; a tool
+    // call later ends the turn, and the hidden tools must not come back.
+    session.setActiveToolsByName(session.getActiveToolNames().filter((n: string) => !n.startsWith("heavy_")));
+    for (const l of listeners) l({ type: "turn_end" });
+    expect(session.getActiveToolNames()).not.toContain("heavy_click");
+    expect(session.getActiveToolNames()).not.toContain("heavy_type");
+
+    // Switched on again by that extension, the tool is kept, and a tool that
+    // registers late is still activated once.
+    session.setActiveToolsByName([...session.getActiveToolNames(), "heavy_click"]);
+    registerLate("/ext/groups.ts", "late_tool");
+    for (const l of listeners) l({ type: "turn_end" });
+    expect(session.getActiveToolNames()).toContain("heavy_click");
+    expect(session.getActiveToolNames()).not.toContain("heavy_type");
+    expect(session.getActiveToolNames()).toContain("late_tool");
+  });
+
   it("ext: admits a late tool from the selected extension but not from others", async () => {
     setup({ extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/foo.ts": [], "/ext/bar.ts": [] });

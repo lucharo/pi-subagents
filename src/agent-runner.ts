@@ -347,6 +347,13 @@ export function installExtensionToolScope(
   // with `defaultActive: false`. `codemode`/`deferred` tools (pi's MCP tools by
   // default) stay undeclared until their extension or `tool_search` activates
   // them — so an already-active tool is kept, or turn_end would undo that.
+  //
+  // A tool is activated once, when renarrow first sees it in scope. One that was
+  // active and is not any more was taken out on purpose (an extension that loads
+  // a group of tools only on demand hides the rest), so it stays out until that
+  // extension puts it back; re-activating it here at every turn_end handed the
+  // child every hidden tool after its first tool call.
+  const offered = new Set<string>();
   const renarrow = () => {
     const allowed = inScope();
     const current = session.getActiveToolNames();
@@ -356,10 +363,12 @@ export function installExtensionToolScope(
       .filter(({ name, exposure = "direct" }) => {
         if (!allowed.has(name)) return false;
         if (active.has(name)) return true;
+        if (offered.has(name)) return false;
         if (exposure !== "direct" && exposure !== "model-only") return false;
         return named.has(name) || session.getToolDefinition(name)?.defaultActive !== false;
       })
       .map((t) => t.name);
+    for (const name of next) offered.add(name);
     // setActiveToolsByName unconditionally rebuilds the system prompt, so skip
     // the no-op that steady-state turns would otherwise pay for every turn.
     if (next.length !== current.length || next.some((n, i) => n !== current[i])) {
